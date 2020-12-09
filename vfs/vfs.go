@@ -4,6 +4,7 @@ package vfs
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
@@ -14,10 +15,14 @@ import (
 
 	"github.com/eikenb/pipeat"
 
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/logger"
+	"github.com/drakkan/sftpgo/utils"
 )
 
 const dirMimeType = "inode/directory"
+
+var validAzAccessTier = []string{"", "Archive", "Hot", "Cool"}
 
 // Fs defines the interface for filesystem backends
 type Fs interface {
@@ -25,8 +30,8 @@ type Fs interface {
 	ConnectionID() string
 	Stat(name string) (os.FileInfo, error)
 	Lstat(name string) (os.FileInfo, error)
-	Open(name string, offset int64) (*os.File, *pipeat.PipeReaderAt, func(), error)
-	Create(name string, flag int) (*os.File, *PipeWriter, func(), error)
+	Open(name string, offset int64) (File, *pipeat.PipeReaderAt, func(), error)
+	Create(name string, flag int) (File, *PipeWriter, func(), error)
 	Rename(source, target string) error
 	Remove(name string, isDir bool) error
 	Mkdir(name string) error
@@ -43,6 +48,7 @@ type Fs interface {
 	ResolvePath(sftpPath string) (string, error)
 	IsNotExist(err error) bool
 	IsPermission(err error) bool
+	IsNotSupported(err error) bool
 	ScanRootDirContents() (int, int64, error)
 	GetDirSize(dirname string) (int, int64, error)
 	GetAtomicUploadPath(name string) string
@@ -50,14 +56,24 @@ type Fs interface {
 	Walk(root string, walkFn filepath.WalkFunc) error
 	Join(elem ...string) string
 	HasVirtualFolders() bool
-}
-
-// MimeTyper defines an optional interface to get the content type
-type MimeTyper interface {
 	GetMimeType(name string) (string, error)
 }
 
-var errUnsupported = errors.New("Not supported")
+// File defines an interface representing a SFTPGo file
+type File interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	io.ReaderAt
+	io.WriterAt
+	io.Seeker
+	Stat() (os.FileInfo, error)
+	Name() string
+	Truncate(size int64) error
+}
+
+// ErrVfsUnsupported defines the error for an unsupported VFS operation
+var ErrVfsUnsupported = errors.New("Not supported")
 
 // QuotaCheckResult defines the result for a quota check
 type QuotaCheckResult struct {
@@ -95,12 +111,12 @@ type S3FsConfig struct {
 	// folder. The prefix, if not empty, must not start with "/" and must
 	// end with "/".
 	// If empty the whole bucket contents will be available
-	KeyPrefix    string `json:"key_prefix,omitempty"`
-	Region       string `json:"region,omitempty"`
-	AccessKey    string `json:"access_key,omitempty"`
-	AccessSecret string `json:"access_secret,omitempty"`
-	Endpoint     string `json:"endpoint,omitempty"`
-	StorageClass string `json:"storage_class,omitempty"`
+	KeyPrefix    string      `json:"key_prefix,omitempty"`
+	Region       string      `json:"region,omitempty"`
+	AccessKey    string      `json:"access_key,omitempty"`
+	AccessSecret *kms.Secret `json:"access_secret,omitempty"`
+	Endpoint     string      `json:"endpoint,omitempty"`
+	StorageClass string      `json:"storage_class,omitempty"`
 	// The buffer size (in MB) to use for multipart uploads. The minimum allowed part size is 5MB,
 	// and if this value is set to zero, the default value (5MB) for the AWS SDK will be used.
 	// The minimum allowed value is 5.
@@ -122,9 +138,10 @@ type GCSFsConfig struct {
 	// folder. The prefix, if not empty, must not start with "/" and must
 	// end with "/".
 	// If empty the whole bucket contents will be available
-	KeyPrefix            string `json:"key_prefix,omitempty"`
-	CredentialFile       string `json:"-"`
-	Credentials          []byte `json:"credentials,omitempty"`
+	KeyPrefix      string      `json:"key_prefix,omitempty"`
+	CredentialFile string      `json:"-"`
+	Credentials    *kms.Secret `json:"credentials,omitempty"`
+	// 0 explicit, 1 automatic
 	AutomaticCredentials int    `json:"automatic_credentials,omitempty"`
 	StorageClass         string `json:"storage_class,omitempty"`
 }
@@ -135,8 +152,8 @@ type AzBlobFsConfig struct {
 	// Storage Account Name, leave blank to use SAS URL
 	AccountName string `json:"account_name,omitempty"`
 	// Storage Account Key leave blank to use SAS URL.
-	// The access key is stored encrypted (AES-256-GCM)
-	AccountKey string `json:"account_key,omitempty"`
+	// The access key is stored encrypted based on the kms configuration
+	AccountKey *kms.Secret `json:"account_key,omitempty"`
 	// Optional endpoint. Default is "blob.core.windows.net".
 	// If you use the emulator the endpoint must include the protocol,
 	// for example "http://127.0.0.1:10000"
@@ -162,6 +179,13 @@ type AzBlobFsConfig struct {
 	UploadConcurrency int `json:"upload_concurrency,omitempty"`
 	// Set to true if you use an Azure emulator such as Azurite
 	UseEmulator bool `json:"use_emulator,omitempty"`
+	// Blob Access Tier
+	AccessTier string `json:"access_tier,omitempty"`
+}
+
+// CryptFsConfig defines the configuration to store local files as encrypted
+type CryptFsConfig struct {
+	Passphrase *kms.Secret `json:"passphrase,omitempty"`
 }
 
 // PipeWriter defines a wrapper for pipeat.PipeWriterAt.
@@ -213,24 +237,45 @@ func IsDirectory(fs Fs, path string) (bool, error) {
 	return fileInfo.IsDir(), err
 }
 
-// IsLocalOsFs returns true if fs is the local filesystem implementation
+// IsLocalOsFs returns true if fs is a local filesystem implementation
 func IsLocalOsFs(fs Fs) bool {
 	return fs.Name() == osFsName
 }
 
-// ValidateS3FsConfig returns nil if the specified s3 config is valid, otherwise an error
-func ValidateS3FsConfig(config *S3FsConfig) error {
-	if len(config.Bucket) == 0 {
-		return errors.New("bucket cannot be empty")
-	}
-	if len(config.Region) == 0 {
-		return errors.New("region cannot be empty")
-	}
-	if len(config.AccessKey) == 0 && len(config.AccessSecret) > 0 {
+// IsCryptOsFs returns true if fs is an encrypted local filesystem implementation
+func IsCryptOsFs(fs Fs) bool {
+	return fs.Name() == cryptFsName
+}
+
+func checkS3Credentials(config *S3FsConfig) error {
+	if config.AccessKey == "" && !config.AccessSecret.IsEmpty() {
 		return errors.New("access_key cannot be empty with access_secret not empty")
 	}
-	if len(config.AccessSecret) == 0 && len(config.AccessKey) > 0 {
+	if config.AccessSecret.IsEmpty() && config.AccessKey != "" {
 		return errors.New("access_secret cannot be empty with access_key not empty")
+	}
+	if config.AccessSecret.IsEncrypted() && !config.AccessSecret.IsValid() {
+		return errors.New("invalid encrypted access_secret")
+	}
+	if !config.AccessSecret.IsEmpty() && !config.AccessSecret.IsValidInput() {
+		return errors.New("invalid access_secret")
+	}
+	return nil
+}
+
+// ValidateS3FsConfig returns nil if the specified s3 config is valid, otherwise an error
+func ValidateS3FsConfig(config *S3FsConfig) error {
+	if config.AccessSecret == nil {
+		config.AccessSecret = kms.NewEmptySecret()
+	}
+	if config.Bucket == "" {
+		return errors.New("bucket cannot be empty")
+	}
+	if config.Region == "" {
+		return errors.New("region cannot be empty")
+	}
+	if err := checkS3Credentials(config); err != nil {
+		return err
 	}
 	if config.KeyPrefix != "" {
 		if strings.HasPrefix(config.KeyPrefix, "/") {
@@ -252,6 +297,9 @@ func ValidateS3FsConfig(config *S3FsConfig) error {
 
 // ValidateGCSFsConfig returns nil if the specified GCS config is valid, otherwise an error
 func ValidateGCSFsConfig(config *GCSFsConfig, credentialsFilePath string) error {
+	if config.Credentials == nil {
+		config.Credentials = kms.NewEmptySecret()
+	}
 	if config.Bucket == "" {
 		return errors.New("bucket cannot be empty")
 	}
@@ -264,7 +312,10 @@ func ValidateGCSFsConfig(config *GCSFsConfig, credentialsFilePath string) error 
 			config.KeyPrefix += "/"
 		}
 	}
-	if len(config.Credentials) == 0 && config.AutomaticCredentials == 0 {
+	if config.Credentials.IsEncrypted() && !config.Credentials.IsValid() {
+		return errors.New("invalid encrypted credentials")
+	}
+	if !config.Credentials.IsValidInput() && config.AutomaticCredentials == 0 {
 		fi, err := os.Stat(credentialsFilePath)
 		if err != nil {
 			return fmt.Errorf("invalid credentials %v", err)
@@ -276,8 +327,21 @@ func ValidateGCSFsConfig(config *GCSFsConfig, credentialsFilePath string) error 
 	return nil
 }
 
+func checkAzCredentials(config *AzBlobFsConfig) error {
+	if config.AccountName == "" || !config.AccountKey.IsValidInput() {
+		return errors.New("credentials cannot be empty or invalid")
+	}
+	if config.AccountKey.IsEncrypted() && !config.AccountKey.IsValid() {
+		return errors.New("invalid encrypted account_key")
+	}
+	return nil
+}
+
 // ValidateAzBlobFsConfig returns nil if the specified Azure Blob config is valid, otherwise an error
 func ValidateAzBlobFsConfig(config *AzBlobFsConfig) error {
+	if config.AccountKey == nil {
+		config.AccountKey = kms.NewEmptySecret()
+	}
 	if config.SASURL != "" {
 		_, err := url.Parse(config.SASURL)
 		return err
@@ -285,8 +349,8 @@ func ValidateAzBlobFsConfig(config *AzBlobFsConfig) error {
 	if config.Container == "" {
 		return errors.New("container cannot be empty")
 	}
-	if config.AccountName == "" || config.AccountKey == "" {
-		return errors.New("credentials cannot be empty")
+	if err := checkAzCredentials(config); err != nil {
+		return err
 	}
 	if config.KeyPrefix != "" {
 		if strings.HasPrefix(config.KeyPrefix, "/") {
@@ -302,6 +366,23 @@ func ValidateAzBlobFsConfig(config *AzBlobFsConfig) error {
 	}
 	if config.UploadConcurrency < 0 || config.UploadConcurrency > 64 {
 		return fmt.Errorf("invalid upload concurrency: %v", config.UploadConcurrency)
+	}
+	if !utils.IsStringInSlice(config.AccessTier, validAzAccessTier) {
+		return fmt.Errorf("invalid access tier %#v, valid values: \"''%v\"", config.AccessTier, strings.Join(validAzAccessTier, ", "))
+	}
+	return nil
+}
+
+// ValidateCryptFsConfig returns nil if the specified CryptFs config is valid, otherwise an error
+func ValidateCryptFsConfig(config *CryptFsConfig) error {
+	if config.Passphrase == nil || config.Passphrase.IsEmpty() {
+		return errors.New("invalid passphrase")
+	}
+	if !config.Passphrase.IsValidInput() {
+		return errors.New("passphrase cannot be empty or invalid")
+	}
+	if config.Passphrase.IsEncrypted() && !config.Passphrase.IsValid() {
+		return errors.New("invalid encrypted passphrase")
 	}
 	return nil
 }

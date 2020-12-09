@@ -26,6 +26,7 @@ import (
 	"github.com/drakkan/sftpgo/dataprovider"
 	"github.com/drakkan/sftpgo/ftpd"
 	"github.com/drakkan/sftpgo/httpd"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/logger"
 	"github.com/drakkan/sftpgo/vfs"
 )
@@ -131,6 +132,13 @@ func TestMain(m *testing.M) {
 	httpConfig := config.GetHTTPConfig()
 	httpConfig.Initialize(configDir)
 
+	kmsConfig := config.GetKMSConfig()
+	err = kmsConfig.Initialize()
+	if err != nil {
+		logger.ErrorToConsole("error initializing kms: %v", err)
+		os.Exit(1)
+	}
+
 	httpdConf := config.GetHTTPDConfig()
 	httpdConf.BindPort = 8079
 	httpd.SetBaseURLAndCredentials("http://127.0.0.1:8079", "", "")
@@ -146,6 +154,12 @@ func TestMain(m *testing.M) {
 	extAuthPath = filepath.Join(homeBasePath, "extauth.sh")
 	preLoginPath = filepath.Join(homeBasePath, "prelogin.sh")
 	postConnectPath = filepath.Join(homeBasePath, "postconnect.sh")
+
+	status := ftpd.GetStatus()
+	if status.IsActive {
+		logger.ErrorToConsole("ftpd is already active")
+		os.Exit(1)
+	}
 
 	go func() {
 		logger.Debug(logSender, "", "initializing FTP server with config %+v", ftpdConf)
@@ -175,6 +189,18 @@ func TestMain(m *testing.M) {
 	os.Remove(certPath)
 	os.Remove(keyPath)
 	os.Exit(exitCode)
+}
+
+func TestInitialization(t *testing.T) {
+	ftpdConf := config.GetFTPDConfig()
+	ftpdConf.BindPort = 2121
+	ftpdConf.CertificateFile = filepath.Join(os.TempDir(), "test_ftpd.crt")
+	ftpdConf.CertificateKeyFile = filepath.Join(os.TempDir(), "test_ftpd.key")
+	ftpdConf.TLSMode = 1
+	err := ftpdConf.Initialize(configDir)
+	assert.Error(t, err)
+	status := ftpd.GetStatus()
+	assert.True(t, status.IsActive)
 }
 
 func TestBasicFTPHandling(t *testing.T) {
@@ -519,12 +545,20 @@ func TestDownloadErrors(t *testing.T) {
 			DeniedExtensions:  []string{".zip"},
 		},
 	}
+	u.Filters.FilePatterns = []dataprovider.PatternsFilter{
+		{
+			Path:            "/sub2",
+			AllowedPatterns: []string{},
+			DeniedPatterns:  []string{"*.jpg"},
+		},
+	}
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
 	client, err := getFTPClient(user, true)
 	if assert.NoError(t, err) {
 		testFilePath1 := filepath.Join(user.HomeDir, subDir1, "file.zip")
 		testFilePath2 := filepath.Join(user.HomeDir, subDir2, "file.zip")
+		testFilePath3 := filepath.Join(user.HomeDir, subDir2, "file.jpg")
 		err = os.MkdirAll(filepath.Dir(testFilePath1), os.ModePerm)
 		assert.NoError(t, err)
 		err = os.MkdirAll(filepath.Dir(testFilePath2), os.ModePerm)
@@ -533,10 +567,14 @@ func TestDownloadErrors(t *testing.T) {
 		assert.NoError(t, err)
 		err = ioutil.WriteFile(testFilePath2, []byte("file2"), os.ModePerm)
 		assert.NoError(t, err)
+		err = ioutil.WriteFile(testFilePath3, []byte("file3"), os.ModePerm)
+		assert.NoError(t, err)
 		localDownloadPath := filepath.Join(homeBasePath, testDLFileName)
 		err = ftpDownloadFile(path.Join("/", subDir1, "file.zip"), localDownloadPath, 5, client, 0)
 		assert.Error(t, err)
 		err = ftpDownloadFile(path.Join("/", subDir2, "file.zip"), localDownloadPath, 5, client, 0)
+		assert.Error(t, err)
+		err = ftpDownloadFile(path.Join("/", subDir2, "file.jpg"), localDownloadPath, 5, client, 0)
 		assert.Error(t, err)
 		err = ftpDownloadFile("/missing.zip", localDownloadPath, 5, client, 0)
 		assert.Error(t, err)
@@ -864,7 +902,7 @@ func TestLoginWithDatabaseCredentials(t *testing.T) {
 	u := getTestUser()
 	u.FsConfig.Provider = dataprovider.GCSFilesystemProvider
 	u.FsConfig.GCSConfig.Bucket = "test"
-	u.FsConfig.GCSConfig.Credentials = []byte(`{ "type": "service_account" }`)
+	u.FsConfig.GCSConfig.Credentials = kms.NewPlainSecret(`{ "type": "service_account" }`)
 
 	providerConf := config.GetProviderConf()
 	providerConf.PreferDatabaseCredentials = true
@@ -885,9 +923,12 @@ func TestLoginWithDatabaseCredentials(t *testing.T) {
 
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
+	assert.Equal(t, kms.SecretStatusSecretBox, user.FsConfig.GCSConfig.Credentials.GetStatus())
+	assert.NotEmpty(t, user.FsConfig.GCSConfig.Credentials.GetPayload())
+	assert.Empty(t, user.FsConfig.GCSConfig.Credentials.GetAdditionalData())
+	assert.Empty(t, user.FsConfig.GCSConfig.Credentials.GetKey())
 
-	_, err = os.Stat(credentialsFile)
-	assert.Error(t, err)
+	assert.NoFileExists(t, credentialsFile)
 
 	client, err := getFTPClient(user, false)
 	if assert.NoError(t, err) {
@@ -910,7 +951,7 @@ func TestLoginInvalidFs(t *testing.T) {
 	u := getTestUser()
 	u.FsConfig.Provider = dataprovider.GCSFilesystemProvider
 	u.FsConfig.GCSConfig.Bucket = "test"
-	u.FsConfig.GCSConfig.Credentials = []byte("invalid JSON for credentials")
+	u.FsConfig.GCSConfig.Credentials = kms.NewPlainSecret("invalid JSON for credentials")
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
 

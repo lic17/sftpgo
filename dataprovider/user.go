@@ -12,6 +12,9 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/webdav"
+
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/logger"
 	"github.com/drakkan/sftpgo/utils"
 	"github.com/drakkan/sftpgo/vfs"
@@ -65,10 +68,11 @@ type CachedUser struct {
 	User       User
 	Expiration time.Time
 	Password   string
+	LockSystem webdav.LockSystem
 }
 
 // IsExpired returns true if the cached user is expired
-func (c CachedUser) IsExpired() bool {
+func (c *CachedUser) IsExpired() bool {
 	if c.Expiration.IsZero() {
 		return false
 	}
@@ -78,23 +82,44 @@ func (c CachedUser) IsExpired() bool {
 // ExtensionsFilter defines filters based on file extensions.
 // These restrictions do not apply to files listing for performance reasons, so
 // a denied file cannot be downloaded/overwritten/renamed but will still be
-// it will still be listed in the list of files.
+// in the list of files.
 // System commands such as Git and rsync interacts with the filesystem directly
 // and they are not aware about these restrictions so they are not allowed
 // inside paths with extensions filters
 type ExtensionsFilter struct {
-	// SFTP/SCP path, if no other specific filter is defined, the filter apply for
+	// Virtual path, if no other specific filter is defined, the filter apply for
 	// sub directories too.
 	// For example if filters are defined for the paths "/" and "/sub" then the
 	// filters for "/" are applied for any file outside the "/sub" directory
 	Path string `json:"path"`
 	// only files with these, case insensitive, extensions are allowed.
 	// Shell like expansion is not supported so you have to specify ".jpg" and
-	// not "*.jpg"
+	// not "*.jpg". If you want shell like patterns use pattern filters
 	AllowedExtensions []string `json:"allowed_extensions,omitempty"`
 	// files with these, case insensitive, extensions are not allowed.
 	// Denied file extensions are evaluated before the allowed ones
 	DeniedExtensions []string `json:"denied_extensions,omitempty"`
+}
+
+// PatternsFilter defines filters based on shell like patterns.
+// These restrictions do not apply to files listing for performance reasons, so
+// a denied file cannot be downloaded/overwritten/renamed but will still be
+// in the list of files.
+// System commands such as Git and rsync interacts with the filesystem directly
+// and they are not aware about these restrictions so they are not allowed
+// inside paths with extensions filters
+type PatternsFilter struct {
+	// Virtual path, if no other specific filter is defined, the filter apply for
+	// sub directories too.
+	// For example if filters are defined for the paths "/" and "/sub" then the
+	// filters for "/" are applied for any file outside the "/sub" directory
+	Path string `json:"path"`
+	// files with these, case insensitive, patterns are allowed.
+	// Denied file patterns are evaluated before the allowed ones
+	AllowedPatterns []string `json:"allowed_patterns,omitempty"`
+	// files with these, case insensitive, patterns are not allowed.
+	// Denied file patterns are evaluated before the allowed ones
+	DeniedPatterns []string `json:"denied_patterns,omitempty"`
 }
 
 // UserFilters defines additional restrictions for a user
@@ -115,6 +140,8 @@ type UserFilters struct {
 	// filters based on file extensions.
 	// Please note that these restrictions can be easily bypassed.
 	FileExtensions []ExtensionsFilter `json:"file_extensions,omitempty"`
+	// filter based on shell patterns
+	FilePatterns []PatternsFilter `json:"file_patterns,omitempty"`
 	// max size allowed for a single upload, 0 means unlimited
 	MaxUploadFileSize int64 `json:"max_upload_file_size,omitempty"`
 }
@@ -128,6 +155,7 @@ const (
 	S3FilesystemProvider                                  // AWS S3 compatible
 	GCSFilesystemProvider                                 // Google Cloud Storage
 	AzureBlobFilesystemProvider                           // Azure Blob Storage
+	CryptedFilesystemProvider                             // Local encrypted
 )
 
 // Filesystem defines cloud storage filesystem details
@@ -136,6 +164,7 @@ type Filesystem struct {
 	S3Config     vfs.S3FsConfig     `json:"s3config,omitempty"`
 	GCSConfig    vfs.GCSFsConfig    `json:"gcsconfig,omitempty"`
 	AzBlobConfig vfs.AzBlobFsConfig `json:"azblobconfig,omitempty"`
+	CryptConfig  vfs.CryptFsConfig  `json:"cryptconfig,omitempty"`
 }
 
 // User defines a SFTPGo user
@@ -188,20 +217,41 @@ type User struct {
 	Filters UserFilters `json:"filters"`
 	// Filesystem configuration details
 	FsConfig Filesystem `json:"filesystem"`
+	// free form text field for external systems
+	AdditionalInfo string `json:"additional_info,omitempty"`
 }
 
 // GetFilesystem returns the filesystem for this user
 func (u *User) GetFilesystem(connectionID string) (vfs.Fs, error) {
-	if u.FsConfig.Provider == S3FilesystemProvider {
+	switch u.FsConfig.Provider {
+	case S3FilesystemProvider:
 		return vfs.NewS3Fs(connectionID, u.GetHomeDir(), u.FsConfig.S3Config)
-	} else if u.FsConfig.Provider == GCSFilesystemProvider {
+	case GCSFilesystemProvider:
 		config := u.FsConfig.GCSConfig
 		config.CredentialFile = u.getGCSCredentialsFilePath()
 		return vfs.NewGCSFs(connectionID, u.GetHomeDir(), config)
-	} else if u.FsConfig.Provider == AzureBlobFilesystemProvider {
+	case AzureBlobFilesystemProvider:
 		return vfs.NewAzBlobFs(connectionID, u.GetHomeDir(), u.FsConfig.AzBlobConfig)
+	case CryptedFilesystemProvider:
+		return vfs.NewCryptFs(connectionID, u.GetHomeDir(), u.FsConfig.CryptConfig)
+	default:
+		return vfs.NewOsFs(connectionID, u.GetHomeDir(), u.VirtualFolders), nil
 	}
-	return vfs.NewOsFs(connectionID, u.GetHomeDir(), u.VirtualFolders), nil
+}
+
+// HideConfidentialData hides user confidential data
+func (u *User) HideConfidentialData() {
+	u.Password = ""
+	switch u.FsConfig.Provider {
+	case S3FilesystemProvider:
+		u.FsConfig.S3Config.AccessSecret.Hide()
+	case GCSFilesystemProvider:
+		u.FsConfig.GCSConfig.Credentials.Hide()
+	case AzureBlobFilesystemProvider:
+		u.FsConfig.AzBlobConfig.AccountKey.Hide()
+	case CryptedFilesystemProvider:
+		u.FsConfig.CryptConfig.Passphrase.Hide()
+	}
 }
 
 // GetPermissionsForPath returns the permissions for the given path.
@@ -441,11 +491,15 @@ func (u *User) GetAllowedLoginMethods() []string {
 }
 
 // IsFileAllowed returns true if the specified file is allowed by the file restrictions filters
-func (u *User) IsFileAllowed(sftpPath string) bool {
+func (u *User) IsFileAllowed(virtualPath string) bool {
+	return u.isFilePatternAllowed(virtualPath) && u.isFileExtensionAllowed(virtualPath)
+}
+
+func (u *User) isFileExtensionAllowed(virtualPath string) bool {
 	if len(u.Filters.FileExtensions) == 0 {
 		return true
 	}
-	dirsForPath := utils.GetDirsForSFTPPath(path.Dir(sftpPath))
+	dirsForPath := utils.GetDirsForSFTPPath(path.Dir(virtualPath))
 	var filter ExtensionsFilter
 	for _, dir := range dirsForPath {
 		for _, f := range u.Filters.FileExtensions {
@@ -454,12 +508,12 @@ func (u *User) IsFileAllowed(sftpPath string) bool {
 				break
 			}
 		}
-		if len(filter.Path) > 0 {
+		if filter.Path != "" {
 			break
 		}
 	}
-	if len(filter.Path) > 0 {
-		toMatch := strings.ToLower(sftpPath)
+	if filter.Path != "" {
+		toMatch := strings.ToLower(virtualPath)
 		for _, denied := range filter.DeniedExtensions {
 			if strings.HasSuffix(toMatch, denied) {
 				return false
@@ -471,6 +525,42 @@ func (u *User) IsFileAllowed(sftpPath string) bool {
 			}
 		}
 		return len(filter.AllowedExtensions) == 0
+	}
+	return true
+}
+
+func (u *User) isFilePatternAllowed(virtualPath string) bool {
+	if len(u.Filters.FilePatterns) == 0 {
+		return true
+	}
+	dirsForPath := utils.GetDirsForSFTPPath(path.Dir(virtualPath))
+	var filter PatternsFilter
+	for _, dir := range dirsForPath {
+		for _, f := range u.Filters.FilePatterns {
+			if f.Path == dir {
+				filter = f
+				break
+			}
+		}
+		if filter.Path != "" {
+			break
+		}
+	}
+	if filter.Path != "" {
+		toMatch := strings.ToLower(path.Base(virtualPath))
+		for _, denied := range filter.DeniedPatterns {
+			matched, err := path.Match(denied, toMatch)
+			if err != nil || matched {
+				return false
+			}
+		}
+		for _, allowed := range filter.AllowedPatterns {
+			matched, err := path.Match(allowed, toMatch)
+			if err == nil && matched {
+				return true
+			}
+		}
+		return len(filter.AllowedPatterns) == 0
 	}
 	return true
 }
@@ -687,7 +777,24 @@ func (u User) GetDeniedIPAsString() string {
 	return result
 }
 
+// SetEmptySecretsIfNil sets the secrets to empty if nil
+func (u *User) SetEmptySecretsIfNil() {
+	if u.FsConfig.S3Config.AccessSecret == nil {
+		u.FsConfig.S3Config.AccessSecret = kms.NewEmptySecret()
+	}
+	if u.FsConfig.GCSConfig.Credentials == nil {
+		u.FsConfig.GCSConfig.Credentials = kms.NewEmptySecret()
+	}
+	if u.FsConfig.AzBlobConfig.AccountKey == nil {
+		u.FsConfig.AzBlobConfig.AccountKey = kms.NewEmptySecret()
+	}
+	if u.FsConfig.CryptConfig.Passphrase == nil {
+		u.FsConfig.CryptConfig.Passphrase = kms.NewEmptySecret()
+	}
+}
+
 func (u *User) getACopy() User {
+	u.SetEmptySecretsIfNil()
 	pubKeys := make([]string, len(u.PublicKeys))
 	copy(pubKeys, u.PublicKeys)
 	virtualFolders := make([]vfs.VirtualFolder, len(u.VirtualFolders))
@@ -708,6 +815,8 @@ func (u *User) getACopy() User {
 	copy(filters.DeniedLoginMethods, u.Filters.DeniedLoginMethods)
 	filters.FileExtensions = make([]ExtensionsFilter, len(u.Filters.FileExtensions))
 	copy(filters.FileExtensions, u.Filters.FileExtensions)
+	filters.FilePatterns = make([]PatternsFilter, len(u.Filters.FilePatterns))
+	copy(filters.FilePatterns, u.Filters.FilePatterns)
 	filters.DeniedProtocols = make([]string, len(u.Filters.DeniedProtocols))
 	copy(filters.DeniedProtocols, u.Filters.DeniedProtocols)
 	fsConfig := Filesystem{
@@ -716,7 +825,7 @@ func (u *User) getACopy() User {
 			Bucket:            u.FsConfig.S3Config.Bucket,
 			Region:            u.FsConfig.S3Config.Region,
 			AccessKey:         u.FsConfig.S3Config.AccessKey,
-			AccessSecret:      u.FsConfig.S3Config.AccessSecret,
+			AccessSecret:      u.FsConfig.S3Config.AccessSecret.Clone(),
 			Endpoint:          u.FsConfig.S3Config.Endpoint,
 			StorageClass:      u.FsConfig.S3Config.StorageClass,
 			KeyPrefix:         u.FsConfig.S3Config.KeyPrefix,
@@ -726,7 +835,7 @@ func (u *User) getACopy() User {
 		GCSConfig: vfs.GCSFsConfig{
 			Bucket:               u.FsConfig.GCSConfig.Bucket,
 			CredentialFile:       u.FsConfig.GCSConfig.CredentialFile,
-			Credentials:          u.FsConfig.GCSConfig.Credentials,
+			Credentials:          u.FsConfig.GCSConfig.Credentials.Clone(),
 			AutomaticCredentials: u.FsConfig.GCSConfig.AutomaticCredentials,
 			StorageClass:         u.FsConfig.GCSConfig.StorageClass,
 			KeyPrefix:            u.FsConfig.GCSConfig.KeyPrefix,
@@ -734,13 +843,17 @@ func (u *User) getACopy() User {
 		AzBlobConfig: vfs.AzBlobFsConfig{
 			Container:         u.FsConfig.AzBlobConfig.Container,
 			AccountName:       u.FsConfig.AzBlobConfig.AccountName,
-			AccountKey:        u.FsConfig.AzBlobConfig.AccountKey,
+			AccountKey:        u.FsConfig.AzBlobConfig.AccountKey.Clone(),
 			Endpoint:          u.FsConfig.AzBlobConfig.Endpoint,
 			SASURL:            u.FsConfig.AzBlobConfig.SASURL,
 			KeyPrefix:         u.FsConfig.AzBlobConfig.KeyPrefix,
 			UploadPartSize:    u.FsConfig.AzBlobConfig.UploadPartSize,
 			UploadConcurrency: u.FsConfig.AzBlobConfig.UploadConcurrency,
 			UseEmulator:       u.FsConfig.AzBlobConfig.UseEmulator,
+			AccessTier:        u.FsConfig.AzBlobConfig.AccessTier,
+		},
+		CryptConfig: vfs.CryptFsConfig{
+			Passphrase: u.FsConfig.CryptConfig.Passphrase.Clone(),
 		},
 	}
 
@@ -767,6 +880,7 @@ func (u *User) getACopy() User {
 		LastLogin:         u.LastLogin,
 		Filters:           filters,
 		FsConfig:          fsConfig,
+		AdditionalInfo:    u.AdditionalInfo,
 	}
 }
 

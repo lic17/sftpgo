@@ -16,6 +16,7 @@ import (
 
 	"github.com/drakkan/sftpgo/common"
 	"github.com/drakkan/sftpgo/dataprovider"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/utils"
 	"github.com/drakkan/sftpgo/version"
 	"github.com/drakkan/sftpgo/vfs"
@@ -29,8 +30,10 @@ const (
 	templateFolders      = "folders.html"
 	templateFolder       = "folder.html"
 	templateMessage      = "message.html"
+	templateStatus       = "status.html"
 	pageUsersTitle       = "Users"
 	pageConnectionsTitle = "Connections"
+	pageStatusTitle      = "Status"
 	pageFoldersTitle     = "Folders"
 	page400Title         = "Bad request"
 	page404Title         = "Not found"
@@ -39,6 +42,7 @@ const (
 	page500Body          = "The server is unable to fulfill your request."
 	defaultQueryLimit    = 500
 	webDateTimeFormat    = "2006-01-02 15:04:05" // YYYY-MM-DD HH:MM:SS
+	redactedSecret       = "[**redacted**]"
 )
 
 var (
@@ -58,9 +62,11 @@ type basePage struct {
 	FolderURL             string
 	APIFoldersURL         string
 	APIFolderQuotaScanURL string
+	StatusURL             string
 	UsersTitle            string
 	ConnectionsTitle      string
 	FoldersTitle          string
+	StatusTitle           string
 	Version               string
 }
 
@@ -79,9 +85,13 @@ type connectionsPage struct {
 	Connections []common.ConnectionStatus
 }
 
+type statusPage struct {
+	basePage
+	Status ServicesStatus
+}
+
 type userPage struct {
 	basePage
-	IsAdd                bool
 	User                 dataprovider.User
 	RootPerms            []string
 	Error                string
@@ -89,6 +99,8 @@ type userPage struct {
 	ValidSSHLoginMethods []string
 	ValidProtocols       []string
 	RootDirPerms         []string
+	RedactedSecret       string
+	IsAdd                bool
 }
 
 type folderPage struct {
@@ -128,12 +140,17 @@ func loadTemplates(templatesPath string) {
 		filepath.Join(templatesPath, templateBase),
 		filepath.Join(templatesPath, templateFolder),
 	}
+	statusPath := []string{
+		filepath.Join(templatesPath, templateBase),
+		filepath.Join(templatesPath, templateStatus),
+	}
 	usersTmpl := utils.LoadTemplate(template.ParseFiles(usersPaths...))
 	userTmpl := utils.LoadTemplate(template.ParseFiles(userPaths...))
 	connectionsTmpl := utils.LoadTemplate(template.ParseFiles(connectionsPaths...))
 	messageTmpl := utils.LoadTemplate(template.ParseFiles(messagePath...))
 	foldersTmpl := utils.LoadTemplate(template.ParseFiles(foldersPath...))
 	folderTmpl := utils.LoadTemplate(template.ParseFiles(folderPath...))
+	statusTmpl := utils.LoadTemplate(template.ParseFiles(statusPath...))
 
 	templates[templateUsers] = usersTmpl
 	templates[templateUser] = userTmpl
@@ -141,6 +158,7 @@ func loadTemplates(templatesPath string) {
 	templates[templateMessage] = messageTmpl
 	templates[templateFolders] = foldersTmpl
 	templates[templateFolder] = folderTmpl
+	templates[templateStatus] = statusTmpl
 }
 
 func getBasePageData(title, currentURL string) basePage {
@@ -157,9 +175,11 @@ func getBasePageData(title, currentURL string) basePage {
 		APIFoldersURL:         folderPath,
 		APIFolderQuotaScanURL: quotaScanVFolderPath,
 		ConnectionsURL:        webConnectionsPath,
+		StatusURL:             webStatusPath,
 		UsersTitle:            pageUsersTitle,
 		ConnectionsTitle:      pageConnectionsTitle,
 		FoldersTitle:          pageFoldersTitle,
+		StatusTitle:           pageStatusTitle,
 		Version:               version.GetAsString(),
 	}
 }
@@ -201,6 +221,7 @@ func renderNotFoundPage(w http.ResponseWriter, err error) {
 }
 
 func renderAddUserPage(w http.ResponseWriter, user dataprovider.User, error string) {
+	user.SetEmptySecretsIfNil()
 	data := userPage{
 		basePage:             getBasePageData("Add a new user", webUserPath),
 		IsAdd:                true,
@@ -210,11 +231,13 @@ func renderAddUserPage(w http.ResponseWriter, user dataprovider.User, error stri
 		ValidSSHLoginMethods: dataprovider.ValidSSHLoginMethods,
 		ValidProtocols:       dataprovider.ValidProtocols,
 		RootDirPerms:         user.GetPermissionsForPath("/"),
+		RedactedSecret:       redactedSecret,
 	}
 	renderTemplate(w, templateUser, data)
 }
 
 func renderUpdateUserPage(w http.ResponseWriter, user dataprovider.User, error string) {
+	user.SetEmptySecretsIfNil()
 	data := userPage{
 		basePage:             getBasePageData("Update user", fmt.Sprintf("%v/%v", webUserPath, user.ID)),
 		IsAdd:                false,
@@ -224,6 +247,7 @@ func renderUpdateUserPage(w http.ResponseWriter, user dataprovider.User, error s
 		ValidSSHLoginMethods: dataprovider.ValidSSHLoginMethods,
 		ValidProtocols:       dataprovider.ValidProtocols,
 		RootDirPerms:         user.GetPermissionsForPath("/"),
+		RedactedSecret:       redactedSecret,
 	}
 	renderTemplate(w, templateUser, data)
 }
@@ -308,35 +332,102 @@ func getSliceFromDelimitedValues(values, delimiter string) []string {
 	return result
 }
 
-func getFileExtensionsFromPostField(value string, extesionsType int) []dataprovider.ExtensionsFilter {
-	var result []dataprovider.ExtensionsFilter
+func getListFromPostFields(value string) map[string][]string {
+	result := make(map[string][]string)
 	for _, cleaned := range getSliceFromDelimitedValues(value, "\n") {
 		if strings.Contains(cleaned, "::") {
 			dirExts := strings.Split(cleaned, "::")
 			if len(dirExts) > 1 {
 				dir := dirExts[0]
-				dir = strings.TrimSpace(dir)
+				dir = path.Clean(strings.TrimSpace(dir))
 				exts := []string{}
 				for _, e := range strings.Split(dirExts[1], ",") {
 					cleanedExt := strings.TrimSpace(e)
-					if len(cleanedExt) > 0 {
+					if cleanedExt != "" {
 						exts = append(exts, cleanedExt)
 					}
 				}
-				if len(dir) > 0 {
-					filter := dataprovider.ExtensionsFilter{
-						Path: dir,
-					}
-					if extesionsType == 1 {
-						filter.AllowedExtensions = exts
-						filter.DeniedExtensions = []string{}
+				if dir != "" {
+					if _, ok := result[dir]; ok {
+						result[dir] = append(result[dir], exts...)
 					} else {
-						filter.DeniedExtensions = exts
-						filter.AllowedExtensions = []string{}
+						result[dir] = exts
 					}
-					result = append(result, filter)
+					result[dir] = utils.RemoveDuplicates(result[dir])
 				}
 			}
+		}
+	}
+	return result
+}
+
+func getFilePatternsFromPostField(valueAllowed, valuesDenied string) []dataprovider.PatternsFilter {
+	var result []dataprovider.PatternsFilter
+	allowedPatterns := getListFromPostFields(valueAllowed)
+	deniedPatterns := getListFromPostFields(valuesDenied)
+
+	for dirAllowed, allowPatterns := range allowedPatterns {
+		filter := dataprovider.PatternsFilter{
+			Path:            dirAllowed,
+			AllowedPatterns: allowPatterns,
+		}
+		for dirDenied, denPatterns := range deniedPatterns {
+			if dirAllowed == dirDenied {
+				filter.DeniedPatterns = denPatterns
+				break
+			}
+		}
+		result = append(result, filter)
+	}
+	for dirDenied, denPatterns := range deniedPatterns {
+		found := false
+		for _, res := range result {
+			if res.Path == dirDenied {
+				found = true
+				break
+			}
+		}
+		if !found {
+			result = append(result, dataprovider.PatternsFilter{
+				Path:           dirDenied,
+				DeniedPatterns: denPatterns,
+			})
+		}
+	}
+	return result
+}
+
+func getFileExtensionsFromPostField(valueAllowed, valuesDenied string) []dataprovider.ExtensionsFilter {
+	var result []dataprovider.ExtensionsFilter
+	allowedExtensions := getListFromPostFields(valueAllowed)
+	deniedExtensions := getListFromPostFields(valuesDenied)
+
+	for dirAllowed, allowedExts := range allowedExtensions {
+		filter := dataprovider.ExtensionsFilter{
+			Path:              dirAllowed,
+			AllowedExtensions: allowedExts,
+		}
+		for dirDenied, deniedExts := range deniedExtensions {
+			if dirAllowed == dirDenied {
+				filter.DeniedExtensions = deniedExts
+				break
+			}
+		}
+		result = append(result, filter)
+	}
+	for dirDenied, deniedExts := range deniedExtensions {
+		found := false
+		for _, res := range result {
+			if res.Path == dirDenied {
+				found = true
+				break
+			}
+		}
+		if !found {
+			result = append(result, dataprovider.ExtensionsFilter{
+				Path:             dirDenied,
+				DeniedExtensions: deniedExts,
+			})
 		}
 	}
 	return result
@@ -348,37 +439,90 @@ func getFiltersFromUserPostFields(r *http.Request) dataprovider.UserFilters {
 	filters.DeniedIP = getSliceFromDelimitedValues(r.Form.Get("denied_ip"), ",")
 	filters.DeniedLoginMethods = r.Form["ssh_login_methods"]
 	filters.DeniedProtocols = r.Form["denied_protocols"]
-	allowedExtensions := getFileExtensionsFromPostField(r.Form.Get("allowed_extensions"), 1)
-	deniedExtensions := getFileExtensionsFromPostField(r.Form.Get("denied_extensions"), 2)
-	extensions := []dataprovider.ExtensionsFilter{}
-	if len(allowedExtensions) > 0 && len(deniedExtensions) > 0 {
-		for _, allowed := range allowedExtensions {
-			for _, denied := range deniedExtensions {
-				if path.Clean(allowed.Path) == path.Clean(denied.Path) {
-					allowed.DeniedExtensions = append(allowed.DeniedExtensions, denied.DeniedExtensions...)
-				}
-			}
-			extensions = append(extensions, allowed)
-		}
-		for _, denied := range deniedExtensions {
-			found := false
-			for _, allowed := range allowedExtensions {
-				if path.Clean(denied.Path) == path.Clean(allowed.Path) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				extensions = append(extensions, denied)
-			}
-		}
-	} else if len(allowedExtensions) > 0 {
-		extensions = append(extensions, allowedExtensions...)
-	} else if len(deniedExtensions) > 0 {
-		extensions = append(extensions, deniedExtensions...)
-	}
-	filters.FileExtensions = extensions
+	filters.FileExtensions = getFileExtensionsFromPostField(r.Form.Get("allowed_extensions"), r.Form.Get("denied_extensions"))
+	filters.FilePatterns = getFilePatternsFromPostField(r.Form.Get("allowed_patterns"), r.Form.Get("denied_patterns"))
 	return filters
+}
+
+func getSecretFromFormField(r *http.Request, field string) *kms.Secret {
+	secret := kms.NewPlainSecret(r.Form.Get(field))
+	if strings.TrimSpace(secret.GetPayload()) == redactedSecret {
+		secret.SetStatus(kms.SecretStatusRedacted)
+	}
+	if strings.TrimSpace(secret.GetPayload()) == "" {
+		secret.SetStatus("")
+	}
+	return secret
+}
+
+func getS3Config(r *http.Request) (vfs.S3FsConfig, error) {
+	var err error
+	config := vfs.S3FsConfig{}
+	config.Bucket = r.Form.Get("s3_bucket")
+	config.Region = r.Form.Get("s3_region")
+	config.AccessKey = r.Form.Get("s3_access_key")
+	config.AccessSecret = getSecretFromFormField(r, "s3_access_secret")
+	config.Endpoint = r.Form.Get("s3_endpoint")
+	config.StorageClass = r.Form.Get("s3_storage_class")
+	config.KeyPrefix = r.Form.Get("s3_key_prefix")
+	config.UploadPartSize, err = strconv.ParseInt(r.Form.Get("s3_upload_part_size"), 10, 64)
+	if err != nil {
+		return config, err
+	}
+	config.UploadConcurrency, err = strconv.Atoi(r.Form.Get("s3_upload_concurrency"))
+	return config, err
+}
+
+func getGCSConfig(r *http.Request) (vfs.GCSFsConfig, error) {
+	var err error
+	config := vfs.GCSFsConfig{}
+
+	config.Bucket = r.Form.Get("gcs_bucket")
+	config.StorageClass = r.Form.Get("gcs_storage_class")
+	config.KeyPrefix = r.Form.Get("gcs_key_prefix")
+	autoCredentials := r.Form.Get("gcs_auto_credentials")
+	if autoCredentials != "" {
+		config.AutomaticCredentials = 1
+	} else {
+		config.AutomaticCredentials = 0
+	}
+	credentials, _, err := r.FormFile("gcs_credential_file")
+	if err == http.ErrMissingFile {
+		return config, nil
+	}
+	if err != nil {
+		return config, err
+	}
+	defer credentials.Close()
+	fileBytes, err := ioutil.ReadAll(credentials)
+	if err != nil || len(fileBytes) == 0 {
+		if len(fileBytes) == 0 {
+			err = errors.New("credentials file size must be greater than 0")
+		}
+		return config, err
+	}
+	config.Credentials = kms.NewPlainSecret(string(fileBytes))
+	config.AutomaticCredentials = 0
+	return config, err
+}
+
+func getAzureConfig(r *http.Request) (vfs.AzBlobFsConfig, error) {
+	var err error
+	config := vfs.AzBlobFsConfig{}
+	config.Container = r.Form.Get("az_container")
+	config.AccountName = r.Form.Get("az_account_name")
+	config.AccountKey = getSecretFromFormField(r, "az_account_key")
+	config.SASURL = r.Form.Get("az_sas_url")
+	config.Endpoint = r.Form.Get("az_endpoint")
+	config.KeyPrefix = r.Form.Get("az_key_prefix")
+	config.AccessTier = r.Form.Get("az_access_tier")
+	config.UseEmulator = len(r.Form.Get("az_use_emulator")) > 0
+	config.UploadPartSize, err = strconv.ParseInt(r.Form.Get("az_upload_part_size"), 10, 64)
+	if err != nil {
+		return config, err
+	}
+	config.UploadConcurrency, err = strconv.Atoi(r.Form.Get("az_upload_concurrency"))
+	return config, err
 }
 
 func getFsConfigFromUserPostFields(r *http.Request) (dataprovider.Filesystem, error) {
@@ -389,64 +533,25 @@ func getFsConfigFromUserPostFields(r *http.Request) (dataprovider.Filesystem, er
 	}
 	fs.Provider = dataprovider.FilesystemProvider(provider)
 	if fs.Provider == dataprovider.S3FilesystemProvider {
-		fs.S3Config.Bucket = r.Form.Get("s3_bucket")
-		fs.S3Config.Region = r.Form.Get("s3_region")
-		fs.S3Config.AccessKey = r.Form.Get("s3_access_key")
-		fs.S3Config.AccessSecret = r.Form.Get("s3_access_secret")
-		fs.S3Config.Endpoint = r.Form.Get("s3_endpoint")
-		fs.S3Config.StorageClass = r.Form.Get("s3_storage_class")
-		fs.S3Config.KeyPrefix = r.Form.Get("s3_key_prefix")
-		fs.S3Config.UploadPartSize, err = strconv.ParseInt(r.Form.Get("s3_upload_part_size"), 10, 64)
+		config, err := getS3Config(r)
 		if err != nil {
 			return fs, err
 		}
-		fs.S3Config.UploadConcurrency, err = strconv.Atoi(r.Form.Get("s3_upload_concurrency"))
-		if err != nil {
-			return fs, err
-		}
+		fs.S3Config = config
 	} else if fs.Provider == dataprovider.GCSFilesystemProvider {
-		fs.GCSConfig.Bucket = r.Form.Get("gcs_bucket")
-		fs.GCSConfig.StorageClass = r.Form.Get("gcs_storage_class")
-		fs.GCSConfig.KeyPrefix = r.Form.Get("gcs_key_prefix")
-		autoCredentials := r.Form.Get("gcs_auto_credentials")
-		if len(autoCredentials) > 0 {
-			fs.GCSConfig.AutomaticCredentials = 1
-		} else {
-			fs.GCSConfig.AutomaticCredentials = 0
-		}
-		credentials, _, err := r.FormFile("gcs_credential_file")
-		if err == http.ErrMissingFile {
-			return fs, nil
-		}
+		config, err := getGCSConfig(r)
 		if err != nil {
 			return fs, err
 		}
-		defer credentials.Close()
-		fileBytes, err := ioutil.ReadAll(credentials)
-		if err != nil || len(fileBytes) == 0 {
-			if len(fileBytes) == 0 {
-				err = errors.New("credentials file size must be greater than 0")
-			}
-			return fs, err
-		}
-		fs.GCSConfig.Credentials = fileBytes
-		fs.GCSConfig.AutomaticCredentials = 0
+		fs.GCSConfig = config
 	} else if fs.Provider == dataprovider.AzureBlobFilesystemProvider {
-		fs.AzBlobConfig.Container = r.Form.Get("az_container")
-		fs.AzBlobConfig.AccountName = r.Form.Get("az_account_name")
-		fs.AzBlobConfig.AccountKey = r.Form.Get("az_account_key")
-		fs.AzBlobConfig.SASURL = r.Form.Get("az_sas_url")
-		fs.AzBlobConfig.Endpoint = r.Form.Get("az_endpoint")
-		fs.AzBlobConfig.KeyPrefix = r.Form.Get("az_key_prefix")
-		fs.AzBlobConfig.UseEmulator = len(r.Form.Get("az_use_emulator")) > 0
-		fs.AzBlobConfig.UploadPartSize, err = strconv.ParseInt(r.Form.Get("az_upload_part_size"), 10, 64)
+		config, err := getAzureConfig(r)
 		if err != nil {
 			return fs, err
 		}
-		fs.AzBlobConfig.UploadConcurrency, err = strconv.Atoi(r.Form.Get("az_upload_concurrency"))
-		if err != nil {
-			return fs, err
-		}
+		fs.AzBlobConfig = config
+	} else if fs.Provider == dataprovider.CryptedFilesystemProvider {
+		fs.CryptConfig.Passphrase = getSecretFromFormField(r, "crypt_passphrase")
 	}
 	return fs, nil
 }
@@ -522,6 +627,7 @@ func getUserFromPostFields(r *http.Request) (dataprovider.User, error) {
 		ExpirationDate:    expirationDateMillis,
 		Filters:           getFiltersFromUserPostFields(r),
 		FsConfig:          fsConfig,
+		AdditionalInfo:    r.Form.Get("additional_info"),
 	}
 	maxFileSize, err := strconv.ParseInt(r.Form.Get("max_upload_file_size"), 10, 64)
 	user.Filters.MaxUploadFileSize = maxFileSize
@@ -612,8 +718,18 @@ func handleWebUpdateUserPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	updatedUser.ID = user.ID
+	updatedUser.SetEmptySecretsIfNil()
 	if len(updatedUser.Password) == 0 {
 		updatedUser.Password = user.Password
+	}
+	if !updatedUser.FsConfig.S3Config.AccessSecret.IsPlain() && !updatedUser.FsConfig.S3Config.AccessSecret.IsEmpty() {
+		updatedUser.FsConfig.S3Config.AccessSecret = user.FsConfig.S3Config.AccessSecret
+	}
+	if !updatedUser.FsConfig.AzBlobConfig.AccountKey.IsPlain() && !updatedUser.FsConfig.AzBlobConfig.AccountKey.IsEmpty() {
+		updatedUser.FsConfig.AzBlobConfig.AccountKey = user.FsConfig.AzBlobConfig.AccountKey
+	}
+	if !updatedUser.FsConfig.CryptConfig.Passphrase.IsPlain() && !updatedUser.FsConfig.CryptConfig.Passphrase.IsEmpty() {
+		updatedUser.FsConfig.CryptConfig.Passphrase = user.FsConfig.CryptConfig.Passphrase
 	}
 	err = dataprovider.UpdateUser(updatedUser)
 	if err == nil {
@@ -624,6 +740,14 @@ func handleWebUpdateUserPost(w http.ResponseWriter, r *http.Request) {
 	} else {
 		renderUpdateUserPage(w, user, err.Error())
 	}
+}
+
+func handleWebGetStatus(w http.ResponseWriter, r *http.Request) {
+	data := statusPage{
+		basePage: getBasePageData(pageStatusTitle, webStatusPath),
+		Status:   getServicesStatus(),
+	}
+	renderTemplate(w, templateStatus, data)
 }
 
 func handleWebGetConnections(w http.ResponseWriter, r *http.Request) {

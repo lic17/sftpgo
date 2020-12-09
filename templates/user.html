@@ -119,7 +119,7 @@
                 {{- end}}
                 {{- end}}</textarea>
             <small id="subDirsHelpBlock" class="form-text text-muted">
-                One directory per line as dir::perms, for example /somedir::list,download
+                One exposed virtual directory path per line as /dir::perms, for example /somedir::list,download
             </small>
         </div>
     </div>
@@ -140,7 +140,7 @@
                 {{$mapping.VirtualPath}}::{{$mapping.MappedPath}}::{{$mapping.QuotaFiles}}::{{$mapping.QuotaSize}}&#10;
                 {{- end}}</textarea>
             <small id="vfHelpBlock" class="form-text text-muted">
-                One mapping per line as vpath::path::[quota_files]::[quota_size(bytes)], for example /vdir::/home/adir or /vdir::C:\adir::10::104857600. Quota -1 means included inside user quota. Ignored for non local filesystems
+                One mapping per line as vpath::fspath::[quota_files]::[quota_size(bytes)], for example /vdir::/home/adir or /vdir::C:\adir::10::104857600. Quota -1 means included inside user quota. Ignored for non local filesystems
             </small>
         </div>
     </div>
@@ -242,6 +242,36 @@
     </div>
 
     <div class="form-group row">
+        <label for="idFilePatternsDenied" class="col-sm-2 col-form-label">Denied file patterns</label>
+        <div class="col-sm-10">
+            <textarea class="form-control" id="idFilePatternsDenied" name="denied_patterns" rows="3"
+                aria-describedby="deniedPatternsHelpBlock">{{range $index, $filter := .User.Filters.FilePatterns -}}
+                {{if $filter.DeniedPatterns -}}
+                {{$filter.Path}}::{{range $idx, $p := $filter.DeniedPatterns}}{{if $idx}},{{end}}{{$p}}{{end}}&#10;
+                {{- end}}
+                {{- end}}</textarea>
+            <small id="deniedPatternsHelpBlock" class="form-text text-muted">
+                One exposed virtual directory per line as /dir::pattern1,pattern2, for example /subdir::*.zip,*.rar
+            </small>
+        </div>
+    </div>
+
+    <div class="form-group row">
+        <label for="idFilePatternsAllowed" class="col-sm-2 col-form-label">Allowed file patterns</label>
+        <div class="col-sm-10">
+            <textarea class="form-control" id="idFilePatternsAllowed" name="allowed_patterns" rows="3"
+                aria-describedby="allowedPatternsHelpBlock">{{range $index, $filter := .User.Filters.FilePatterns -}}
+                {{if $filter.AllowedPatterns -}}
+                {{$filter.Path}}::{{range $idx, $p := $filter.AllowedPatterns}}{{if $idx}},{{end}}{{$p}}{{end}}&#10;
+                {{- end}}
+                {{- end}}</textarea>
+            <small id="allowedPatternsHelpBlock" class="form-text text-muted">
+                One exposed virtual directory per line as /dir::pattern1,pattern2, for example /somedir::*.jpg,*.png
+            </small>
+        </div>
+    </div>
+
+    <div class="form-group row">
         <label for="idFilesExtensionsDenied" class="col-sm-2 col-form-label">Denied file extensions</label>
         <div class="col-sm-10">
             <textarea class="form-control" id="idFilesExtensionsDenied" name="denied_extensions" rows="3"
@@ -251,7 +281,7 @@
                 {{- end}}
                 {{- end}}</textarea>
             <small id="deniedExtensionsHelpBlock" class="form-text text-muted">
-                One directory per line as dir::extensions1,extensions2, for example /subdir::.zip,.rar
+                One exposed virtual directory per line as /dir::extension1,extension2, for example /subdir::.zip,.rar. Deprecated, use file patterns
             </small>
         </div>
     </div>
@@ -266,7 +296,7 @@
                 {{- end}}
                 {{- end}}</textarea>
             <small id="allowedExtensionsHelpBlock" class="form-text text-muted">
-                One directory per line as dir::extensions1,extensions2, for example /somedir::.jpg,.png
+                One exposed virtual directory per line as /dir::extension1,extension2, for example /somedir::.jpg,.png. Deprecated, use file patterns
             </small>
         </div>
     </div>
@@ -275,11 +305,20 @@
         <label for="idFilesystem" class="col-sm-2 col-form-label">Storage</label>
         <div class="col-sm-10">
             <select class="form-control" id="idFilesystem" name="fs_provider" onchange="onFilesystemChanged(this.value)">
-                <option value="0" {{if eq .User.FsConfig.Provider 0 }}selected{{end}}>local</option>
+                <option value="0" {{if eq .User.FsConfig.Provider 0 }}selected{{end}}>Local</option>
+                <option value="4" {{if eq .User.FsConfig.Provider 4 }}selected{{end}}>Local encrypted</option>
                 <option value="1" {{if eq .User.FsConfig.Provider 1 }}selected{{end}}>AWS S3 (Compatible)</option>
                 <option value="2" {{if eq .User.FsConfig.Provider 2 }}selected{{end}}>Google Cloud Storage</option>
                 <option value="3" {{if eq .User.FsConfig.Provider 3 }}selected{{end}}>Azure Blob Storage</option>
             </select>
+        </div>
+    </div>
+
+    <div class="form-group row crypt">
+        <label for="idCryptPassphrase" class="col-sm-2 col-form-label">Passphrase</label>
+        <div class="col-sm-10">
+            <input type="text" class="form-control" id="idCryptPassphrase" name="crypt_passphrase" placeholder=""
+                value="{{if .User.FsConfig.CryptConfig.Passphrase.IsEncrypted}}{{.RedactedSecret}}{{else}}{{.User.FsConfig.CryptConfig.Passphrase.GetPayload}}{{end}}" maxlength="1000">
         </div>
     </div>
 
@@ -307,7 +346,7 @@
         <label for="idS3AccessSecret" class="col-sm-2 col-form-label">Access Secret</label>
         <div class="col-sm-3">
             <input type="text" class="form-control" id="idS3AccessSecret" name="s3_access_secret" placeholder=""
-                value="{{.User.FsConfig.S3Config.AccessSecret}}" maxlength="1000">
+                value="{{if .User.FsConfig.S3Config.AccessSecret.IsEncrypted}}{{.RedactedSecret}}{{else}}{{.User.FsConfig.S3Config.AccessSecret.GetPayload}}{{end}}" maxlength="1000">
         </div>
     </div>
 
@@ -315,7 +354,7 @@
         <label for="idS3StorageClass" class="col-sm-2 col-form-label">Storage Class</label>
         <div class="col-sm-3">
             <input type="text" class="form-control" id="idS3StorageClass" name="s3_storage_class" placeholder=""
-                value="{{.User.FsConfig.S3Config.StorageClass}}" maxlength="1000">
+                value="{{.User.FsConfig.S3Config.StorageClass}}" maxlength="255">
         </div>
         <div class="col-sm-2"></div>
         <label for="idS3Endpoint" class="col-sm-2 col-form-label">Endpoint</label>
@@ -418,7 +457,7 @@
         <label for="idAzAccountKey" class="col-sm-2 col-form-label">Account Key</label>
         <div class="col-sm-10">
             <input type="text" class="form-control" id="idAzAccountKey" name="az_account_key" placeholder=""
-                value="{{.User.FsConfig.AzBlobConfig.AccountKey}}" maxlength="255">
+                value="{{if .User.FsConfig.AzBlobConfig.AccountKey.IsEncrypted}}{{.RedactedSecret}}{{else}}{{.User.FsConfig.AzBlobConfig.AccountKey.GetPayload}}{{end}}" maxlength="1000">
         </div>
     </div>
 
@@ -434,6 +473,18 @@
         <div class="col-sm-10">
             <input type="text" class="form-control" id="idAzEndpoint" name="az_endpoint" placeholder=""
                 value="{{.User.FsConfig.AzBlobConfig.Endpoint}}" maxlength="255">
+        </div>
+    </div>
+
+    <div class="form-group row azblob">
+        <label for="idAzAccessTier" class="col-sm-2 col-form-label">Access Tier</label>
+        <div class="col-sm-10">
+            <select class="form-control" id="idAzAccessTier" name="az_access_tier">
+                <option value="" {{if eq .User.FsConfig.AzBlobConfig.AccessTier "" }}selected{{end}}>Default</option>
+                <option value="Hot" {{if eq .User.FsConfig.AzBlobConfig.AccessTier "Hot" }}selected{{end}}>Hot</option>
+                <option value="Cool" {{if eq .User.FsConfig.AzBlobConfig.AccessTier "Cool" }}selected{{end}}>Cool</option>
+                <option value="Archive" {{if eq .User.FsConfig.AzBlobConfig.AccessTier "Archive" }}selected{{end}}>Archive</option>
+            </select>
         </div>
     </div>
 
@@ -472,6 +523,17 @@
         <div class="form-check">
             <input type="checkbox" class="form-check-input" id="idUseEmulator" name="az_use_emulator" {{if .User.FsConfig.AzBlobConfig.UseEmulator}}checked{{end}}>
             <label for="idUseEmulator" class="form-check-label">Use Azure Blob emulator</label>
+        </div>
+    </div>
+
+    <div class="form-group row">
+        <label for="idAdditionalInfo" class="col-sm-2 col-form-label">Additional info</label>
+        <div class="col-sm-10">
+            <textarea class="form-control" id="idAdditionalInfo" name="additional_info" rows="3"
+                aria-describedby="additionalInfoHelpBlock">{{.User.AdditionalInfo}}</textarea>
+            <small id="additionalInfoHelpBlock" class="form-text text-muted">
+                Free form text field
+            </small>
         </div>
     </div>
 
@@ -539,25 +601,36 @@
             $('.form-group.gcs').hide();
             $('.form-group.row.azblob').hide();
             $('.form-group.azblob').hide();
+            $('.form-group.crypt').hide();
             $('.form-group.row.s3').show();
         } else if (val == '2'){
             $('.form-group.row.gcs').show();
             $('.form-group.gcs').show();
             $('.form-group.row.azblob').hide();
             $('.form-group.azblob').hide();
+            $('.form-group.crypt').hide();
             $('.form-group.row.s3').hide();
         } else if (val == '3'){
             $('.form-group.row.azblob').show();
             $('.form-group.azblob').show();
             $('.form-group.row.gcs').hide();
             $('.form-group.gcs').hide();
+            $('.form-group.crypt').hide();
             $('.form-group.row.s3').hide();
+        } else if (val == '4'){
+            $('.form-group.row.gcs').hide();
+            $('.form-group.gcs').hide();
+            $('.form-group.row.s3').hide();
+            $('.form-group.row.azblob').hide();
+            $('.form-group.azblob').hide();
+            $('.form-group.crypt').show();
         } else {
             $('.form-group.row.gcs').hide();
             $('.form-group.gcs').hide();
             $('.form-group.row.s3').hide();
             $('.form-group.row.azblob').hide();
             $('.form-group.azblob').hide();
+            $('.form-group.crypt').hide();
         }
     }
 </script>

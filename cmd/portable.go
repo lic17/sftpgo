@@ -14,6 +14,7 @@ import (
 
 	"github.com/drakkan/sftpgo/common"
 	"github.com/drakkan/sftpgo/dataprovider"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/service"
 	"github.com/drakkan/sftpgo/sftpd"
 	"github.com/drakkan/sftpgo/version"
@@ -32,8 +33,8 @@ var (
 	portablePublicKeys           []string
 	portablePermissions          []string
 	portableSSHCommands          []string
-	portableAllowedExtensions    []string
-	portableDeniedExtensions     []string
+	portableAllowedPatterns      []string
+	portableDeniedPatterns       []string
 	portableFsProvider           int
 	portableS3Bucket             string
 	portableS3Region             string
@@ -59,11 +60,13 @@ var (
 	portableAzAccountName        string
 	portableAzAccountKey         string
 	portableAzEndpoint           string
+	portableAzAccessTier         string
 	portableAzSASURL             string
 	portableAzKeyPrefix          string
 	portableAzULPartSize         int
 	portableAzULConcurrency      int
 	portableAzUseEmulator        bool
+	portableCryptPassphrase      string
 	portableCmd                  = &cobra.Command{
 		Use:   "portable",
 		Short: "Serve a single directory",
@@ -122,7 +125,7 @@ Please take a look at the usage below to customize the serving parameters`,
 			}
 			service := service.Service{
 				ConfigDir:     filepath.Clean(defaultConfigDir),
-				ConfigFile:    defaultConfigName,
+				ConfigFile:    defaultConfigFile,
 				LogFilePath:   portableLogFile,
 				LogMaxSize:    defaultLogMaxSize,
 				LogMaxBackups: defaultLogMaxBackup,
@@ -145,7 +148,7 @@ Please take a look at the usage below to customize the serving parameters`,
 							Bucket:            portableS3Bucket,
 							Region:            portableS3Region,
 							AccessKey:         portableS3AccessKey,
-							AccessSecret:      portableS3AccessSecret,
+							AccessSecret:      kms.NewPlainSecret(portableS3AccessSecret),
 							Endpoint:          portableS3Endpoint,
 							StorageClass:      portableS3StorageClass,
 							KeyPrefix:         portableS3KeyPrefix,
@@ -154,7 +157,7 @@ Please take a look at the usage below to customize the serving parameters`,
 						},
 						GCSConfig: vfs.GCSFsConfig{
 							Bucket:               portableGCSBucket,
-							Credentials:          portableGCSCredentials,
+							Credentials:          kms.NewPlainSecret(string(portableGCSCredentials)),
 							AutomaticCredentials: portableGCSAutoCredentials,
 							StorageClass:         portableGCSStorageClass,
 							KeyPrefix:            portableGCSKeyPrefix,
@@ -162,17 +165,21 @@ Please take a look at the usage below to customize the serving parameters`,
 						AzBlobConfig: vfs.AzBlobFsConfig{
 							Container:         portableAzContainer,
 							AccountName:       portableAzAccountName,
-							AccountKey:        portableAzAccountKey,
+							AccountKey:        kms.NewPlainSecret(portableAzAccountKey),
 							Endpoint:          portableAzEndpoint,
+							AccessTier:        portableAzAccessTier,
 							SASURL:            portableAzSASURL,
 							KeyPrefix:         portableAzKeyPrefix,
 							UseEmulator:       portableAzUseEmulator,
 							UploadPartSize:    int64(portableAzULPartSize),
 							UploadConcurrency: portableAzULConcurrency,
 						},
+						CryptConfig: vfs.CryptFsConfig{
+							Passphrase: kms.NewPlainSecret(portableCryptPassphrase),
+						},
 					},
 					Filters: dataprovider.UserFilters{
-						FileExtensions: parseFileExtensionsFilters(),
+						FilePatterns: parsePatternsFilesFilters(),
 					},
 				},
 			}
@@ -195,7 +202,8 @@ func init() {
 This can be an absolute path or a path
 relative to the current directory
 `)
-	portableCmd.Flags().IntVarP(&portableSFTPDPort, "sftpd-port", "s", 0, "0 means a random unprivileged port")
+	portableCmd.Flags().IntVarP(&portableSFTPDPort, "sftpd-port", "s", 0, `0 means a random unprivileged port,
+< 0 disabled`)
 	portableCmd.Flags().IntVar(&portableFTPDPort, "ftpd-port", -1, `0 means a random unprivileged port,
 < 0 disabled`)
 	portableCmd.Flags().IntVar(&portableWebDAVPort, "webdav-port", -1, `0 means a random unprivileged port,
@@ -215,18 +223,18 @@ value`)
 	portableCmd.Flags().StringSliceVarP(&portablePermissions, "permissions", "g", []string{"list", "download"},
 		`User's permissions. "*" means any
 permission`)
-	portableCmd.Flags().StringArrayVar(&portableAllowedExtensions, "allowed-extensions", []string{},
-		`Allowed file extensions case
-insensitive. The format is
-/dir::ext1,ext2.
-For example: "/somedir::.jpg,.png"`)
-	portableCmd.Flags().StringArrayVar(&portableDeniedExtensions, "denied-extensions", []string{},
-		`Denied file extensions case
-insensitive. The format is
-/dir::ext1,ext2.
-For example: "/somedir::.jpg,.png"`)
+	portableCmd.Flags().StringArrayVar(&portableAllowedPatterns, "allowed-patterns", []string{},
+		`Allowed file patterns case insensitive.
+The format is:
+/dir::pattern1,pattern2.
+For example: "/somedir::*.jpg,a*b?.png"`)
+	portableCmd.Flags().StringArrayVar(&portableDeniedPatterns, "denied-patterns", []string{},
+		`Denied file patterns case insensitive.
+The format is:
+/dir::pattern1,pattern2.
+For example: "/somedir::*.jpg,a*b?.png"`)
 	portableCmd.Flags().BoolVarP(&portableAdvertiseService, "advertise-service", "S", false,
-		`Advertise SFTP/FTP service using
+		`Advertise configured services using
 multicast DNS`)
 	portableCmd.Flags().BoolVarP(&portableAdvertiseCredentials, "advertise-credentials", "C", false,
 		`If the SFTP/FTP service is
@@ -236,7 +244,8 @@ inside the advertised TXT record`)
 	portableCmd.Flags().IntVarP(&portableFsProvider, "fs-provider", "f", int(dataprovider.LocalFilesystemProvider), `0 => local filesystem
 1 => AWS S3 compatible
 2 => Google Cloud Storage
-3 => Azure Blob Storage`)
+3 => Azure Blob Storage
+4 => Encrypted local filesystem`)
 	portableCmd.Flags().StringVar(&portableS3Bucket, "s3-bucket", "", "")
 	portableCmd.Flags().StringVar(&portableS3Region, "s3-region", "", "")
 	portableCmd.Flags().StringVar(&portableS3AccessKey, "s3-access-key", "", "")
@@ -272,6 +281,8 @@ HTTPS`)
 	portableCmd.Flags().StringVar(&portableAzSASURL, "az-sas-url", "", `Shared access signature URL`)
 	portableCmd.Flags().StringVar(&portableAzEndpoint, "az-endpoint", "", `Leave empty to use the default:
 "blob.core.windows.net"`)
+	portableCmd.Flags().StringVar(&portableAzAccessTier, "az-access-tier", "", `Leave empty to use the default
+container setting`)
 	portableCmd.Flags().StringVar(&portableAzKeyPrefix, "az-key-prefix", "", `Allows to restrict access to the
 virtual folder identified by this
 prefix and its contents`)
@@ -280,45 +291,46 @@ prefix and its contents`)
 	portableCmd.Flags().IntVar(&portableAzULConcurrency, "az-upload-concurrency", 2, `How many parts are uploaded in
 parallel`)
 	portableCmd.Flags().BoolVar(&portableAzUseEmulator, "az-use-emulator", false, "")
+	portableCmd.Flags().StringVar(&portableCryptPassphrase, "crypto-passphrase", "", `Passphrase for encryption/decryption`)
 	rootCmd.AddCommand(portableCmd)
 }
 
-func parseFileExtensionsFilters() []dataprovider.ExtensionsFilter {
-	var extensions []dataprovider.ExtensionsFilter
-	for _, val := range portableAllowedExtensions {
-		p, exts := getExtensionsFilterValues(strings.TrimSpace(val))
+func parsePatternsFilesFilters() []dataprovider.PatternsFilter {
+	var patterns []dataprovider.PatternsFilter
+	for _, val := range portableAllowedPatterns {
+		p, exts := getPatternsFilterValues(strings.TrimSpace(val))
 		if len(p) > 0 {
-			extensions = append(extensions, dataprovider.ExtensionsFilter{
-				Path:              path.Clean(p),
-				AllowedExtensions: exts,
-				DeniedExtensions:  []string{},
+			patterns = append(patterns, dataprovider.PatternsFilter{
+				Path:            path.Clean(p),
+				AllowedPatterns: exts,
+				DeniedPatterns:  []string{},
 			})
 		}
 	}
-	for _, val := range portableDeniedExtensions {
-		p, exts := getExtensionsFilterValues(strings.TrimSpace(val))
+	for _, val := range portableDeniedPatterns {
+		p, exts := getPatternsFilterValues(strings.TrimSpace(val))
 		if len(p) > 0 {
 			found := false
-			for index, e := range extensions {
+			for index, e := range patterns {
 				if path.Clean(e.Path) == path.Clean(p) {
-					extensions[index].DeniedExtensions = append(extensions[index].DeniedExtensions, exts...)
+					patterns[index].DeniedPatterns = append(patterns[index].DeniedPatterns, exts...)
 					found = true
 					break
 				}
 			}
 			if !found {
-				extensions = append(extensions, dataprovider.ExtensionsFilter{
-					Path:              path.Clean(p),
-					AllowedExtensions: []string{},
-					DeniedExtensions:  exts,
+				patterns = append(patterns, dataprovider.PatternsFilter{
+					Path:            path.Clean(p),
+					AllowedPatterns: []string{},
+					DeniedPatterns:  exts,
 				})
 			}
 		}
 	}
-	return extensions
+	return patterns
 }
 
-func getExtensionsFilterValues(value string) (string, []string) {
+func getPatternsFilterValues(value string) (string, []string) {
 	if strings.Contains(value, "::") {
 		dirExts := strings.Split(value, "::")
 		if len(dirExts) > 1 {
@@ -330,7 +342,7 @@ func getExtensionsFilterValues(value string) (string, []string) {
 					exts = append(exts, cleanedExt)
 				}
 			}
-			if len(dir) > 0 && len(exts) > 0 {
+			if dir != "" && len(exts) > 0 {
 				return dir, exts
 			}
 		}

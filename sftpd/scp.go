@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 
@@ -28,11 +29,16 @@ type scpCommand struct {
 	sshCommand
 }
 
-func (c *scpCommand) handle() error {
+func (c *scpCommand) handle() (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(logSender, "", "panic in handle scp command: %#v stack strace: %v", r, string(debug.Stack()))
+			err = common.ErrGenericFailure
+		}
+	}()
 	common.Connections.Add(c.connection)
 	defer common.Connections.Remove(c.connection.GetID())
 
-	var err error
 	destPath := c.getDestPath()
 	commandType := c.getCommandType()
 	c.connection.Log(logger.LevelDebug, "handle scp command, args: %v user: %v command type: %v, dest path: %#v",
@@ -254,7 +260,7 @@ func (c *scpCommand) handleUpload(uploadFilePath string, sizeToRead int64) error
 		filePath = c.connection.Fs.GetAtomicUploadPath(p)
 	}
 	stat, statErr := c.connection.Fs.Lstat(p)
-	if (statErr == nil && stat.Mode()&os.ModeSymlink == os.ModeSymlink) || c.connection.Fs.IsNotExist(statErr) {
+	if (statErr == nil && stat.Mode()&os.ModeSymlink != 0) || c.connection.Fs.IsNotExist(statErr) {
 		if !c.connection.User.HasPerm(dataprovider.PermUpload, path.Dir(uploadFilePath)) {
 			c.connection.Log(logger.LevelWarn, "cannot upload file: %#v, permission denied", uploadFilePath)
 			c.sendErrorMessage(common.ErrPermissionDenied)
@@ -346,7 +352,7 @@ func (c *scpCommand) handleRecursiveDownload(dirPath string, stat os.FileInfo) e
 		var dirs []string
 		for _, file := range files {
 			filePath := c.connection.Fs.GetRelativePath(c.connection.Fs.Join(dirPath, file.Name()))
-			if file.Mode().IsRegular() || file.Mode()&os.ModeSymlink == os.ModeSymlink {
+			if file.Mode().IsRegular() || file.Mode()&os.ModeSymlink != 0 {
 				err = c.handleDownload(filePath)
 				if err != nil {
 					break
@@ -397,6 +403,9 @@ func (c *scpCommand) sendDownloadFileData(filePath string, stat os.FileInfo, tra
 		if err != nil {
 			return err
 		}
+	}
+	if vfs.IsCryptOsFs(c.connection.Fs) {
+		stat = c.connection.Fs.(*vfs.CryptFs).ConvertFileInfo(stat)
 	}
 
 	fileSize := stat.Size()

@@ -1,18 +1,35 @@
 openapi: 3.0.3
 info:
   title: SFTPGo
-  description: 'SFTPGo REST API'
-  version: 2.0.0
+  description: SFTPGo REST API
+  version: 2.2.1
 
 servers:
-- url: /api/v1
+  - url: /api/v1
 security:
-- BasicAuth: []
+  - BasicAuth: []
 paths:
+  /healthz:
+    get:
+      security: []
+      servers:
+        - url : /
+      tags:
+        - healthcheck
+      summary: health check
+      description: Health endpoint to check if the application is still running and responding to requests
+      responses:
+        200:
+          description: successful operation
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
   /version:
     get:
       tags:
-      - version
+        - maintenance
       summary: Get version details
       operationId: get_version
       responses:
@@ -30,33 +47,10 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         default:
           $ref: '#/components/responses/DefaultResponse'
-  /providerstatus:
-    get:
-      tags:
-      - providerstatus
-      summary: Get data provider status
-      operationId: get_provider_status
-      responses:
-        200:
-          description: successful operation
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ApiResponse'
-              example:
-                message: "Alive"
-        401:
-          $ref: '#/components/responses/Unauthorized'
-        403:
-          $ref: '#/components/responses/Forbidden'
-        500:
-          $ref: '#/components/responses/InternalServerError'
-        default:
-          $ref: '#/components/responses/DefaultResponse'
   /connection:
     get:
       tags:
-      - connections
+        - connections
       summary: Get the active users and info about their uploads/downloads
       operationId: get_connections
       responses:
@@ -79,16 +73,16 @@ paths:
   /connection/{connectionID}:
     delete:
       tags:
-      - connections
+        - connections
       summary: Terminate an active connection
       operationId: close_connection
       parameters:
-      - name: connectionID
-        in: path
-        description: ID of the connection to close
-        required: true
-        schema:
-          type: string
+        - name: connectionID
+          in: path
+          description: ID of the connection to close
+          required: true
+          schema:
+            type: string
       responses:
         200:
           description: successful operation
@@ -111,7 +105,7 @@ paths:
   /quota_scan:
     get:
       tags:
-      - quota
+        - quota
       summary: Get the active quota scans for users home directories
       operationId: get_quota_scans
       responses:
@@ -133,7 +127,7 @@ paths:
           $ref: '#/components/responses/DefaultResponse'
     post:
       tags:
-      - quota
+        - quota
       summary: start a new user quota scan
       description: A quota scan update the number of files and their total size for the specified user
       operationId: start_quota_scan
@@ -169,7 +163,7 @@ paths:
   /quota_update:
     put:
       tags:
-      - quota
+        - quota
       summary: update the user used quota limits
       description: Set the current used quota limits for the given user
       operationId: quota_update
@@ -219,7 +213,7 @@ paths:
   /folder_quota_update:
     put:
       tags:
-      - quota
+        - quota
       summary: update the folder used quota limits
       description: Set the current used quota limits for the given folder
       operationId: folder_quota_update
@@ -269,7 +263,7 @@ paths:
   /folder_quota_scan:
     get:
       tags:
-      - quota
+        - quota
       summary: Get the active quota scans for folders
       operationId: get_folders_quota_scans
       responses:
@@ -291,7 +285,7 @@ paths:
           $ref: '#/components/responses/DefaultResponse'
     post:
       tags:
-      - quota
+        - quota
       summary: start a new folder quota scan
       description: A quota scan update the number of files and their total size for the specified folder
       operationId: start_folder_quota_scan
@@ -327,7 +321,7 @@ paths:
   /folder:
     get:
       tags:
-      - folders
+        - folders
       summary: Returns an array with one or more folders
       operationId: get_folders
       parameters:
@@ -384,7 +378,7 @@ paths:
           $ref: '#/components/responses/DefaultResponse'
     post:
       tags:
-      - folders
+        - folders
       summary: Adds a new folder
       operationId: add_folder
       description: a new folder with the specified mapped_path will be added. To update the used quota parameters a quota scan is needed
@@ -413,16 +407,16 @@ paths:
           $ref: '#/components/responses/DefaultResponse'
     delete:
       tags:
-      - folders
+        - folders
       summary: Delete an existing folder
       operationId: delete_folder
       parameters:
-      - name: folder_path
-        in: query
-        description: path to the folder to delete
-        required: true
-        schema:
-          type: string
+        - name: folder_path
+          in: query
+          description: path to the folder to delete
+          required: true
+          schema:
+            type: string
       responses:
         200:
           description: successful operation
@@ -447,7 +441,7 @@ paths:
   /user:
     get:
       tags:
-      - users
+        - users
       summary: Returns an array with one or more users
       description: For security reasons hashed passwords are omitted in the response
       operationId: get_users
@@ -505,7 +499,7 @@ paths:
           $ref: '#/components/responses/DefaultResponse'
     post:
       tags:
-      - users
+        - users
       summary: Adds a new user
       operationId: add_user
       requestBody:
@@ -534,18 +528,18 @@ paths:
   /user/{userID}:
     get:
       tags:
-      - users
+        - users
       summary: Find user by ID
       description: For security reasons the hashed password is omitted in the response
       operationId: get_user_by_id
       parameters:
-      - name: userID
-        in: path
-        description: ID of the user to retrieve
-        required: true
-        schema:
-          type: integer
-          format: int32
+        - name: userID
+          in: path
+          description: ID of the user to retrieve
+          required: true
+          schema:
+            type: integer
+            format: int32
       responses:
         200:
           description: successful operation
@@ -567,28 +561,28 @@ paths:
           $ref: '#/components/responses/DefaultResponse'
     put:
       tags:
-      - users
+        - users
       summary: Update an existing user
       operationId: update_user
       parameters:
-      - name: userID
-        in: path
-        description: ID of the user to update
-        required: true
-        schema:
-          type: integer
-          format: int32
-      - in: query
-        name: disconnect
-        schema:
-          type: integer
-          enum:
-            - 0
-            - 1
-        description: >
-          Disconnect:
-            * `0` The user will not be disconnected and it will continue to use the old configuration until connected. This is the default
-            * `1` The user will be disconnected after a successful update. It must login again and so it will be forced to use the new configuration
+        - name: userID
+          in: path
+          description: ID of the user to update
+          required: true
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: disconnect
+          schema:
+            type: integer
+            enum:
+              - 0
+              - 1
+          description: >
+            Disconnect:
+              * `0` The user will not be disconnected and it will continue to use the old configuration until connected. This is the default
+              * `1` The user will be disconnected after a successful update. It must login again and so it will be forced to use the new configuration
       requestBody:
         required: true
         content:
@@ -618,17 +612,17 @@ paths:
           $ref: '#/components/responses/DefaultResponse'
     delete:
       tags:
-      - users
+        - users
       summary: Delete an existing user
       operationId: delete_user
       parameters:
-      - name: userID
-        in: path
-        description: ID of the user to delete
-        required: true
-        schema:
-          type: integer
-          format: int32
+        - name: userID
+          in: path
+          description: ID of the user to delete
+          required: true
+          schema:
+            type: integer
+            format: int32
       responses:
         200:
           description: successful operation
@@ -650,12 +644,35 @@ paths:
           $ref: '#/components/responses/InternalServerError'
         default:
           $ref: '#/components/responses/DefaultResponse'
+  /status:
+    get:
+      tags:
+        - maintenance
+      summary: Retrieve the status of the active services
+      operationId: get_status
+      responses:
+        200:
+          description: successful operation
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServicesStatus'
+        400:
+          $ref: '#/components/responses/BadRequest'
+        401:
+          $ref: '#/components/responses/Unauthorized'
+        403:
+          $ref: '#/components/responses/Forbidden'
+        500:
+          $ref: '#/components/responses/InternalServerError'
+        default:
+          $ref: '#/components/responses/DefaultResponse'
   /dumpdata:
     get:
       tags:
-      - maintenance
-      summary: Backup SFTPGo data serializing them as JSON
-      description: The backup is saved to a local file to avoid to expose users hashed passwords over the network. The output of dumpdata can be used as input for loaddata
+        - maintenance
+      summary: Backup SFTPGo data as data provider independent JSON
+      description: The backup is saved to a local file to avoid to expose sensitive data over the network. The output of dumpdata can be used as input for loaddata
       operationId: dumpdata
       parameters:
         - in: query
@@ -697,7 +714,7 @@ paths:
   /loaddata:
     get:
       tags:
-      - maintenance
+        - maintenance
       summary: Restore SFTPGo data from a JSON backup
       description: Users and folders will be restored one by one and the restore is stopped if a user/folder cannot be added or updated, so it could happen a partial restore
       operationId: loaddata
@@ -853,12 +870,32 @@ components:
         - 'SSH'
         - 'FTP'
         - 'DAV'
+    PatternsFilter:
+      type: object
+      properties:
+        path:
+          type: string
+          description: exposed virtual path, if no other specific filter is defined, the filter apply for sub directories too. For example if filters are defined for the paths "/" and "/sub" then the filters for "/" are applied for any file outside the "/sub" directory
+        allowed_patterns:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: list of, case insensitive, allowed shell like file patterns.
+          example: [ "*.jpg", "a*b?.png" ]
+        denied_patterns:
+          type: array
+          items:
+            type: string
+          nullable: true
+          description: list of, case insensitive, denied shell like file patterns. Denied patterns are evaluated before the allowed ones
+          example: [ "*.zip" ]
     ExtensionsFilter:
       type: object
       properties:
         path:
           type: string
-          description: exposed SFTPGo path, if no other specific filter is defined, the filter apply for sub directories too. For example if filters are defined for the paths "/" and "/sub" then the filters for "/" are applied for any file outside the "/sub" directory
+          description: exposed virtual path, if no other specific filter is defined, the filter apply for sub directories too. For example if filters are defined for the paths "/" and "/sub" then the filters for "/" are applied for any file outside the "/sub" directory
         allowed_extensions:
           type: array
           items:
@@ -902,18 +939,47 @@ components:
             $ref: '#/components/schemas/SupportedProtocols'
           nullable: true
           description: if null or empty any available protocol is allowed
+        file_patterns:
+          type: array
+          items:
+            $ref: '#/components/schemas/PatternsFilter'
+          nullable: true
+          description: filters based on shell like file patterns. These restrictions do not apply to files listing for performance reasons, so a denied file cannot be downloaded/overwritten/renamed but it will still be in the list of files. Please note that these restrictions can be easily bypassed
         file_extensions:
           type: array
           items:
             $ref: '#/components/schemas/ExtensionsFilter'
           nullable: true
-          description: filters based on file extensions. These restrictions do not apply to files listing for performance reasons, so a denied file cannot be downloaded/overwritten/renamed but it will still be listed in the list of files. Please note that these restrictions can be easily bypassed
+          description: filters based on shell like patterns. Deprecated, use file_patterns. These restrictions do not apply to files listing for performance reasons, so a denied file cannot be downloaded/overwritten/renamed but it will still be in the list of files. Please note that these restrictions can be easily bypassed
         max_upload_file_size:
           type: integer
           format: int64
           nullable: true
           description: maximum allowed size, as bytes, for a single file upload. The upload will be aborted if/when the size of the file being sent exceeds this limit. 0 means unlimited. This restriction does not apply for SSH system commands such as `git` and `rsync`
       description: Additional restrictions
+    Secret:
+      type: object
+      properties:
+        status:
+          type: string
+          enum:
+            - Plain
+            - AES-256-GCM
+            - Secretbox
+            - GCP
+            - AWS
+            - VaultTransit
+            - Redacted
+          description: Set to "Plain" to add or update an existing secret, set to "Redacted" to preserve the existing value
+        payload:
+          type: string
+        key:
+          type: string
+        additional_data:
+          type: string
+        mode:
+          type: integer
+          description: 1 means encrypted using a master key
     S3Config:
       type: object
       properties:
@@ -926,8 +992,7 @@ components:
         access_key:
           type: string
         access_secret:
-          type: string
-          description: the access secret is stored encrypted (AES-256-GCM)
+          $ref: '#/components/schemas/Secret'
         endpoint:
           type: string
           description: optional endpoint
@@ -955,9 +1020,7 @@ components:
           type: string
           minLength: 1
         credentials:
-          type: string
-          format: byte
-          description: Google Cloud Storage JSON credentials base64 encoded. This field must be populated only when adding/updating a user. It will be always omitted, since there are sensitive data, when you search/get users. The credentials will be stored in the configured "credentials_path"
+          $ref: '#/components/schemas/Secret'
         automatic_credentials:
           type: integer
           nullable: true
@@ -977,7 +1040,7 @@ components:
       required:
         - bucket
       nullable: true
-      description: Google Cloud Storage configuration details
+      description: Google Cloud Storage configuration details. The "credentials" field must be populated only when adding/updating a user. It will be always omitted, since there are sensitive data, when you search/get users
     AzureBlobFsConfig:
       type: object
       properties:
@@ -987,8 +1050,7 @@ components:
           type: string
           description: Storage Account Name, leave blank to use SAS URL
         account_key:
-          type: string
-          description: Storage Account Key leave blank to use SAS URL. The access key is stored encrypted (AES-256-GCM)
+          $ref: '#/components/schemas/Secret'
         sas_url:
           type: string
           description: Shared access signature URL, leave blank if using account/key
@@ -1001,6 +1063,13 @@ components:
         upload_concurrency:
           type: integer
           description: the number of parts to upload in parallel. If this value is set to zero, the default value (2) will be used
+        access_tier:
+          type: string
+          enum:
+            - ""
+            - "Archive"
+            - "Hot"
+            - "Cool"
         key_prefix:
           type: string
           description: key_prefix is similar to a chroot directory for a local filesystem. If specified the user will only see contents that starts with this prefix and so you can restrict access to a specific virtual folder. The prefix, if not empty, must not start with "/" and must end with "/". If empty the whole container contents will be available
@@ -1009,6 +1078,12 @@ components:
           type: boolean
       nullable: true
       description: Azure Blob Storage configuration details
+    CryptFsConfig:
+      type: object
+      properties:
+        passphrase:
+          $ref: '#/components/schemas/Secret'
+      description: Crypt filesystem configuration details
     FilesystemConfig:
       type: object
       properties:
@@ -1019,18 +1094,22 @@ components:
             - 1
             - 2
             - 3
+            - 4
           description: >
             Providers:
               * `0` - Local filesystem
               * `1` - S3 Compatible Object Storage
               * `2` - Google Cloud Storage
               * `3` - Azure Blob Storage
+              * `4` - Local filesystem encrypted
         s3config:
           $ref: '#/components/schemas/S3Config'
         gcsconfig:
           $ref: '#/components/schemas/GCSConfig'
         azblobconfig:
           $ref: '#/components/schemas/AzureBlobFsConfig'
+        cryptconfig:
+          $ref: '#/components/schemas/CryptFsConfig'
       description: Storage filesystem details
     BaseVirtualFolder:
       type: object
@@ -1172,11 +1251,14 @@ components:
         last_login:
           type: integer
           format: int64
-          description: Last user login as unix timestamp in milliseconds
+          description: Last user login as unix timestamp in milliseconds. It is saved at most once every 10 minutes
         filters:
           $ref: '#/components/schemas/UserFilters'
         filesystem:
           $ref: '#/components/schemas/FilesystemConfig'
+        additional_info:
+          type: string
+          description: Free form text field for external systems
     Transfer:
       type: object
       properties:
@@ -1257,6 +1339,83 @@ components:
           type: integer
           format: int64
           description: scan start time as unix timestamp in milliseconds
+    SSHHostKey:
+      type: object
+      properties:
+        path:
+          type: string
+        fingerprint:
+          type: string
+    BaseServiceStatus:
+      type: object
+      properties:
+        is_active:
+          type: boolean
+        address:
+          type: string
+          description: TCP address the server listen on in the form "host:port"
+    SSHServiceStatus:
+      allOf:
+        - $ref: '#/components/schemas/BaseServiceStatus'
+        - type: object
+          properties:
+            host_keys:
+              type: array
+              items:
+                $ref: '#/components/schemas/SSHHostKey'
+            ssh_commands:
+              type: string
+              description: accepted SSH commands comma separated
+    FTPPassivePortRange:
+      type: object
+      properties:
+        start:
+          type: integer
+        end:
+          type: integer
+    FTPServiceStatus:
+      allOf:
+        - $ref: '#/components/schemas/BaseServiceStatus'
+        - type: object
+          properties:
+            passive_port_range:
+              $ref: '#/components/schemas/FTPPassivePortRange'
+            ftpes:
+              type: string
+              enum:
+                - Disabled
+                - Enabled
+                - Required
+    WebDAVServiceStatus:
+      allOf:
+        - $ref: '#/components/schemas/BaseServiceStatus'
+        - type: object
+          properties:
+            protocol:
+              type: string
+              enum:
+                - HTTP
+                - HTTPS
+    DataProviderStatus:
+      type: object
+      properties:
+        is_active:
+          type: boolean
+        driver:
+          type: string
+        error:
+          type: string
+    ServicesStatus:
+      type: object
+      properties:
+        ssh:
+          $ref: '#/components/schemas/SSHServiceStatus'
+        ftp:
+          $ref: '#/components/schemas/FTPServiceStatus'
+        webdav:
+          $ref: '#/components/schemas/WebDAVServiceStatus'
+        data_provider:
+          $ref: '#/components/schemas/DataProviderStatus'
     ApiResponse:
       type: object
       properties:

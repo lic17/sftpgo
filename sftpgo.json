@@ -62,9 +62,14 @@
       "max_age": 0
     },
     "cache": {
-      "enabled": true,
-      "expiration_time": 0,
-      "max_size": 50
+      "users": {
+        "expiration_time": 0,
+        "max_size": 50
+      },
+      "mime_types": {
+        "enabled": true,
+        "max_size": 1000
+      }
     }
   },
   "data_provider": {
@@ -117,5 +122,11 @@
     "timeout": 20,
     "ca_certificates": [],
     "skip_tls_verify": false
+  },
+  "kms": {
+    "secrets": {
+      "url": "",
+      "master_key_path": ""
+    }
   }
 }

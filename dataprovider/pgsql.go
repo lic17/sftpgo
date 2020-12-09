@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	// we import lib/pq here to be able to disable PostgreSQL support using a build tag
 	_ "github.com/lib/pq"
@@ -37,6 +38,8 @@ ALTER TABLE "{{folders_mapping}}" ADD CONSTRAINT "folders_mapping_user_id_fk_use
 CREATE INDEX "folders_mapping_folder_id_idx" ON "{{folders_mapping}}" ("folder_id");
 CREATE INDEX "folders_mapping_user_id_idx" ON "{{folders_mapping}}" ("user_id");
 `
+	pgsqlV6SQL     = `ALTER TABLE "{{users}}" ADD COLUMN "additional_info" text NULL;`
+	pgsqlV6DownSQL = `ALTER TABLE "{{users}}" DROP COLUMN "additional_info" CASCADE;`
 )
 
 // PGSQLProvider auth provider for PostgreSQL database
@@ -56,6 +59,12 @@ func initializePGSQLProvider() error {
 		providerLog(logger.LevelDebug, "postgres database handle created, connection string: %#v, pool size: %v",
 			getPGSQLConnectionString(true), config.PoolSize)
 		dbHandle.SetMaxOpenConns(config.PoolSize)
+		if config.PoolSize > 0 {
+			dbHandle.SetMaxIdleConns(config.PoolSize)
+		} else {
+			dbHandle.SetMaxIdleConns(2)
+		}
+		dbHandle.SetConnMaxLifetime(240 * time.Second)
 		provider = PGSQLProvider{dbHandle: dbHandle}
 	} else {
 		providerLog(logger.LevelWarn, "error creating postgres database handler, connection string: %#v, error: %v",
@@ -209,26 +218,83 @@ func (p PGSQLProvider) migrateDatabase() error {
 	}
 	switch dbVersion.Version {
 	case 1:
-		err = updatePGSQLDatabaseFrom1To2(p.dbHandle)
-		if err != nil {
-			return err
-		}
-		err = updatePGSQLDatabaseFrom2To3(p.dbHandle)
-		if err != nil {
-			return err
-		}
-		return updatePGSQLDatabaseFrom3To4(p.dbHandle)
+		return updatePGSQLDatabaseFromV1(p.dbHandle)
 	case 2:
-		err = updatePGSQLDatabaseFrom2To3(p.dbHandle)
+		return updatePGSQLDatabaseFromV2(p.dbHandle)
+	case 3:
+		return updatePGSQLDatabaseFromV3(p.dbHandle)
+	case 4:
+		return updatePGSQLDatabaseFromV4(p.dbHandle)
+	case 5:
+		return updatePGSQLDatabaseFromV5(p.dbHandle)
+	default:
+		if dbVersion.Version > sqlDatabaseVersion {
+			providerLog(logger.LevelWarn, "database version %v is newer than the supported: %v", dbVersion.Version,
+				sqlDatabaseVersion)
+			logger.WarnToConsole("database version %v is newer than the supported: %v", dbVersion.Version,
+				sqlDatabaseVersion)
+			return nil
+		}
+		return fmt.Errorf("Database version not handled: %v", dbVersion.Version)
+	}
+}
+
+func (p PGSQLProvider) revertDatabase(targetVersion int) error {
+	dbVersion, err := sqlCommonGetDatabaseVersion(p.dbHandle, true)
+	if err != nil {
+		return err
+	}
+	if dbVersion.Version == targetVersion {
+		return fmt.Errorf("current version match target version, nothing to do")
+	}
+	switch dbVersion.Version {
+	case 6:
+		err = downgradePGSQLDatabaseFrom6To5(p.dbHandle)
 		if err != nil {
 			return err
 		}
-		return updatePGSQLDatabaseFrom3To4(p.dbHandle)
-	case 3:
-		return updatePGSQLDatabaseFrom3To4(p.dbHandle)
+		return downgradePGSQLDatabaseFrom5To4(p.dbHandle)
+	case 5:
+		return downgradePGSQLDatabaseFrom5To4(p.dbHandle)
 	default:
 		return fmt.Errorf("Database version not handled: %v", dbVersion.Version)
 	}
+}
+
+func updatePGSQLDatabaseFromV1(dbHandle *sql.DB) error {
+	err := updatePGSQLDatabaseFrom1To2(dbHandle)
+	if err != nil {
+		return err
+	}
+	return updatePGSQLDatabaseFromV2(dbHandle)
+}
+
+func updatePGSQLDatabaseFromV2(dbHandle *sql.DB) error {
+	err := updatePGSQLDatabaseFrom2To3(dbHandle)
+	if err != nil {
+		return err
+	}
+	return updatePGSQLDatabaseFromV3(dbHandle)
+}
+
+func updatePGSQLDatabaseFromV3(dbHandle *sql.DB) error {
+	err := updatePGSQLDatabaseFrom3To4(dbHandle)
+	if err != nil {
+		return err
+	}
+	return updatePGSQLDatabaseFromV4(dbHandle)
+}
+
+func updatePGSQLDatabaseFromV4(dbHandle *sql.DB) error {
+	err := updatePGSQLDatabaseFrom4To5(dbHandle)
+	if err != nil {
+		return err
+	}
+	return updatePGSQLDatabaseFromV5(dbHandle)
+}
+
+func updatePGSQLDatabaseFromV5(dbHandle *sql.DB) error {
+	return updatePGSQLDatabaseFrom5To6(dbHandle)
 }
 
 func updatePGSQLDatabaseFrom1To2(dbHandle *sql.DB) error {
@@ -247,4 +313,26 @@ func updatePGSQLDatabaseFrom2To3(dbHandle *sql.DB) error {
 
 func updatePGSQLDatabaseFrom3To4(dbHandle *sql.DB) error {
 	return sqlCommonUpdateDatabaseFrom3To4(pgsqlV4SQL, dbHandle)
+}
+
+func updatePGSQLDatabaseFrom4To5(dbHandle *sql.DB) error {
+	return sqlCommonUpdateDatabaseFrom4To5(dbHandle)
+}
+
+func updatePGSQLDatabaseFrom5To6(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database version: 5 -> 6")
+	providerLog(logger.LevelInfo, "updating database version: 5 -> 6")
+	sql := strings.Replace(pgsqlV6SQL, "{{users}}", sqlTableUsers, 1)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 6)
+}
+
+func downgradePGSQLDatabaseFrom6To5(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database version: 6 -> 5")
+	providerLog(logger.LevelInfo, "downgrading database version: 6 -> 5")
+	sql := strings.Replace(pgsqlV6DownSQL, "{{users}}", sqlTableUsers, 1)
+	return sqlCommonExecSQLAndUpdateDBVersion(dbHandle, []string{sql}, 5)
+}
+
+func downgradePGSQLDatabaseFrom5To4(dbHandle *sql.DB) error {
+	return sqlCommonDowngradeDatabaseFrom5To4(dbHandle)
 }

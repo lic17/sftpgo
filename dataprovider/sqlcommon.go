@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	sqlDatabaseVersion     = 4
+	sqlDatabaseVersion     = 6
 	initialDBVersionSQL    = "INSERT INTO {{schema_version}} (version) VALUES (1);"
 	defaultSQLQueryTimeout = 10 * time.Second
 	longSQLQueryTimeout    = 60 * time.Second
@@ -218,7 +218,7 @@ func sqlCommonAddUser(user User, dbHandle *sql.DB) error {
 	}
 	_, err = stmt.ExecContext(ctx, user.Username, user.Password, string(publicKeys), user.HomeDir, user.UID, user.GID, user.MaxSessions, user.QuotaSize,
 		user.QuotaFiles, string(permissions), user.UploadBandwidth, user.DownloadBandwidth, user.Status, user.ExpirationDate, string(filters),
-		string(fsConfig))
+		string(fsConfig), user.AdditionalInfo)
 	if err != nil {
 		sqlCommonRollbackTransaction(tx)
 		return err
@@ -272,7 +272,7 @@ func sqlCommonUpdateUser(user User, dbHandle *sql.DB) error {
 	}
 	_, err = stmt.ExecContext(ctx, user.Password, string(publicKeys), user.HomeDir, user.UID, user.GID, user.MaxSessions, user.QuotaSize,
 		user.QuotaFiles, string(permissions), user.UploadBandwidth, user.DownloadBandwidth, user.Status, user.ExpirationDate,
-		string(filters), string(fsConfig), user.ID)
+		string(filters), string(fsConfig), user.AdditionalInfo, user.ID)
 	if err != nil {
 		sqlCommonRollbackTransaction(tx)
 		return err
@@ -354,7 +354,8 @@ func sqlCommonGetUsers(limit int, offset int, order string, username string, dbH
 			if err != nil {
 				return users, err
 			}
-			users = append(users, HideUserSensitiveData(&u))
+			u.HideConfidentialData()
+			users = append(users, u)
 		}
 	}
 	err = rows.Err()
@@ -390,15 +391,18 @@ func getUserFromDbRow(row *sql.Row, rows *sql.Rows) (User, error) {
 	var publicKey sql.NullString
 	var filters sql.NullString
 	var fsConfig sql.NullString
+	var additionalInfo sql.NullString
 	var err error
 	if row != nil {
 		err = row.Scan(&user.ID, &user.Username, &password, &publicKey, &user.HomeDir, &user.UID, &user.GID, &user.MaxSessions,
 			&user.QuotaSize, &user.QuotaFiles, &permissions, &user.UsedQuotaSize, &user.UsedQuotaFiles, &user.LastQuotaUpdate,
-			&user.UploadBandwidth, &user.DownloadBandwidth, &user.ExpirationDate, &user.LastLogin, &user.Status, &filters, &fsConfig)
+			&user.UploadBandwidth, &user.DownloadBandwidth, &user.ExpirationDate, &user.LastLogin, &user.Status, &filters, &fsConfig,
+			&additionalInfo)
 	} else {
 		err = rows.Scan(&user.ID, &user.Username, &password, &publicKey, &user.HomeDir, &user.UID, &user.GID, &user.MaxSessions,
 			&user.QuotaSize, &user.QuotaFiles, &permissions, &user.UsedQuotaSize, &user.UsedQuotaFiles, &user.LastQuotaUpdate,
-			&user.UploadBandwidth, &user.DownloadBandwidth, &user.ExpirationDate, &user.LastLogin, &user.Status, &filters, &fsConfig)
+			&user.UploadBandwidth, &user.DownloadBandwidth, &user.ExpirationDate, &user.LastLogin, &user.Status, &filters, &fsConfig,
+			&additionalInfo)
 	}
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -439,6 +443,10 @@ func getUserFromDbRow(row *sql.Row, rows *sql.Rows) (User, error) {
 			user.FsConfig = fs
 		}
 	}
+	if additionalInfo.Valid {
+		user.AdditionalInfo = additionalInfo.String
+	}
+	user.SetEmptySecretsIfNil()
 	return user, err
 }
 
@@ -939,4 +947,168 @@ func sqlCommonUpdateDatabaseFrom3To4(sqlV4 string, dbHandle *sql.DB) error {
 		go updateVFoldersQuotaAfterRestore(foldersToScan)
 	}
 	return err
+}
+
+//nolint:dupl
+func sqlCommonUpdateDatabaseFrom4To5(dbHandle *sql.DB) error {
+	logger.InfoToConsole("updating database version: 4 -> 5")
+	providerLog(logger.LevelInfo, "updating database version: 4 -> 5")
+	ctx, cancel := context.WithTimeout(context.Background(), longSQLQueryTimeout)
+	defer cancel()
+	q := getCompatV4FsConfigQuery()
+	stmt, err := dbHandle.PrepareContext(ctx, q)
+	if err != nil {
+		providerLog(logger.LevelWarn, "error preparing database query %#v: %v", q, err)
+		return err
+	}
+	defer stmt.Close()
+	rows, err := stmt.QueryContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	users := []User{}
+	for rows.Next() {
+		var compatUser compatUserV4
+		var fsConfigString sql.NullString
+		err = rows.Scan(&compatUser.ID, &compatUser.Username, &fsConfigString)
+		if err != nil {
+			return err
+		}
+		if fsConfigString.Valid {
+			err = json.Unmarshal([]byte(fsConfigString.String), &compatUser.FsConfig)
+			if err != nil {
+				logger.WarnToConsole("failed to unmarshal v4 user %#v, is it already migrated?", compatUser.Username)
+				continue
+			}
+			fsConfig, err := convertFsConfigFromV4(compatUser.FsConfig, compatUser.Username)
+			if err != nil {
+				return err
+			}
+			users = append(users, createUserFromV4(compatUser, fsConfig))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, user := range users {
+		err = sqlCommonUpdateV4User(dbHandle, user)
+		if err != nil {
+			return err
+		}
+		providerLog(logger.LevelInfo, "filesystem config updated for user %#v", user.Username)
+	}
+
+	ctxVersion, cancelVersion := context.WithTimeout(context.Background(), defaultSQLQueryTimeout)
+	defer cancelVersion()
+
+	return sqlCommonUpdateDatabaseVersion(ctxVersion, dbHandle, 5)
+}
+
+func sqlCommonUpdateV4CompatUser(dbHandle *sql.DB, user compatUserV4) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultSQLQueryTimeout)
+	defer cancel()
+
+	q := updateCompatV4FsConfigQuery()
+	stmt, err := dbHandle.PrepareContext(ctx, q)
+	if err != nil {
+		providerLog(logger.LevelWarn, "error preparing database query %#v: %v", q, err)
+		return err
+	}
+	defer stmt.Close()
+
+	fsConfig, err := json.Marshal(user.FsConfig)
+	if err != nil {
+		return err
+	}
+	_, err = stmt.ExecContext(ctx, string(fsConfig), user.ID)
+	return err
+}
+
+func sqlCommonUpdateV4User(dbHandle *sql.DB, user User) error {
+	err := validateFilesystemConfig(&user)
+	if err != nil {
+		return err
+	}
+	err = saveGCSCredentials(&user)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultSQLQueryTimeout)
+	defer cancel()
+
+	q := updateCompatV4FsConfigQuery()
+	stmt, err := dbHandle.PrepareContext(ctx, q)
+	if err != nil {
+		providerLog(logger.LevelWarn, "error preparing database query %#v: %v", q, err)
+		return err
+	}
+	defer stmt.Close()
+
+	fsConfig, err := user.GetFsConfigAsJSON()
+	if err != nil {
+		return err
+	}
+	_, err = stmt.ExecContext(ctx, string(fsConfig), user.ID)
+	return err
+}
+
+//nolint:dupl
+func sqlCommonDowngradeDatabaseFrom5To4(dbHandle *sql.DB) error {
+	logger.InfoToConsole("downgrading database version: 5 -> 4")
+	providerLog(logger.LevelInfo, "downgrading database version: 5 -> 4")
+	ctx, cancel := context.WithTimeout(context.Background(), longSQLQueryTimeout)
+	defer cancel()
+	q := getCompatV4FsConfigQuery()
+	stmt, err := dbHandle.PrepareContext(ctx, q)
+	if err != nil {
+		providerLog(logger.LevelWarn, "error preparing database query %#v: %v", q, err)
+		return err
+	}
+	defer stmt.Close()
+	rows, err := stmt.QueryContext(ctx)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	users := []compatUserV4{}
+	for rows.Next() {
+		var user User
+		var fsConfigString sql.NullString
+		err = rows.Scan(&user.ID, &user.Username, &fsConfigString)
+		if err != nil {
+			return err
+		}
+		if fsConfigString.Valid {
+			err = json.Unmarshal([]byte(fsConfigString.String), &user.FsConfig)
+			if err != nil {
+				logger.WarnToConsole("failed to unmarshal user %#v to v4, is it already migrated?", user.Username)
+				continue
+			}
+			fsConfig, err := convertFsConfigToV4(user.FsConfig, user.Username)
+			if err != nil {
+				return err
+			}
+			users = append(users, convertUserToV4(user, fsConfig))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, user := range users {
+		err = sqlCommonUpdateV4CompatUser(dbHandle, user)
+		if err != nil {
+			return err
+		}
+		providerLog(logger.LevelInfo, "filesystem config downgraded for user %#v", user.Username)
+	}
+
+	ctxVersion, cancelVersion := context.WithTimeout(context.Background(), defaultSQLQueryTimeout)
+	defer cancelVersion()
+
+	return sqlCommonUpdateDatabaseVersion(ctxVersion, dbHandle, 4)
 }

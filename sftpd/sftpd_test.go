@@ -41,7 +41,9 @@ import (
 	"github.com/drakkan/sftpgo/config"
 	"github.com/drakkan/sftpgo/dataprovider"
 	"github.com/drakkan/sftpgo/httpd"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/logger"
+	"github.com/drakkan/sftpgo/sftpd"
 	"github.com/drakkan/sftpgo/utils"
 	"github.com/drakkan/sftpgo/vfs"
 )
@@ -177,6 +179,12 @@ func TestMain(m *testing.M) {
 
 	httpConfig := config.GetHTTPConfig()
 	httpConfig.Initialize(configDir)
+	kmsConfig := config.GetKMSConfig()
+	err = kmsConfig.Initialize()
+	if err != nil {
+		logger.ErrorToConsole("error initializing kms: %v", err)
+		os.Exit(1)
+	}
 
 	sftpdConf := config.GetSFTPDConfig()
 	httpdConf := config.GetHTTPDConfig()
@@ -360,6 +368,8 @@ func TestBasicSFTPHandling(t *testing.T) {
 	assert.NoError(t, err)
 	err = os.RemoveAll(user.GetHomeDir())
 	assert.NoError(t, err)
+	status := sftpd.GetStatus()
+	assert.True(t, status.IsActive)
 }
 
 func TestOpenReadWrite(t *testing.T) {
@@ -462,13 +472,12 @@ func TestConcurrency(t *testing.T) {
 
 			client, err := getSftpClient(user, usePubKey)
 			if assert.NoError(t, err) {
-				defer client.Close()
-
 				err = checkBasicSFTP(client)
 				assert.NoError(t, err)
 				err = sftpUploadFile(testFilePath, testFileName+strconv.Itoa(counter), testFileSize, client)
 				assert.NoError(t, err)
 				assert.Greater(t, common.Connections.GetActiveSessions(defaultUsername), 0)
+				client.Close()
 			}
 		}(i)
 	}
@@ -574,9 +583,9 @@ func TestUploadResume(t *testing.T) {
 		assert.NoError(t, err)
 		initialHash, err := computeHashForFile(sha256.New(), testFilePath)
 		assert.NoError(t, err)
-		donwloadedFileHash, err := computeHashForFile(sha256.New(), localDownloadPath)
+		downloadedFileHash, err := computeHashForFile(sha256.New(), localDownloadPath)
 		assert.NoError(t, err)
-		assert.Equal(t, initialHash, donwloadedFileHash)
+		assert.Equal(t, initialHash, downloadedFileHash)
 		err = sftpUploadResumeFile(testFilePath, testFileName, testFileSize+appendDataSize, true, client)
 		assert.Error(t, err, "file upload resume with invalid offset must fail")
 		err = os.Remove(testFilePath)
@@ -754,11 +763,11 @@ func TestStat(t *testing.T) {
 		assert.NoError(t, err)
 		info, err := client.Lstat(symlinkName)
 		if assert.NoError(t, err) {
-			assert.True(t, info.Mode()&os.ModeSymlink == os.ModeSymlink)
+			assert.True(t, info.Mode()&os.ModeSymlink != 0)
 		}
 		info, err = client.Stat(symlinkName)
 		if assert.NoError(t, err) {
-			assert.False(t, info.Mode()&os.ModeSymlink == os.ModeSymlink)
+			assert.False(t, info.Mode()&os.ModeSymlink != 0)
 		}
 		linkName, err := client.ReadLink(symlinkName)
 		assert.NoError(t, err)
@@ -1313,7 +1322,7 @@ func TestLoginWithDatabaseCredentials(t *testing.T) {
 	u := getTestUser(usePubKey)
 	u.FsConfig.Provider = dataprovider.GCSFilesystemProvider
 	u.FsConfig.GCSConfig.Bucket = "testbucket"
-	u.FsConfig.GCSConfig.Credentials = []byte(`{ "type": "service_account" }`)
+	u.FsConfig.GCSConfig.Credentials = kms.NewPlainSecret(`{ "type": "service_account" }`)
 
 	providerConf := config.GetProviderConf()
 	providerConf.PreferDatabaseCredentials = true
@@ -1334,9 +1343,12 @@ func TestLoginWithDatabaseCredentials(t *testing.T) {
 
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
+	assert.Equal(t, kms.SecretStatusSecretBox, user.FsConfig.GCSConfig.Credentials.GetStatus())
+	assert.NotEmpty(t, user.FsConfig.GCSConfig.Credentials.GetPayload())
+	assert.Empty(t, user.FsConfig.GCSConfig.Credentials.GetAdditionalData())
+	assert.Empty(t, user.FsConfig.GCSConfig.Credentials.GetKey())
 
-	_, err = os.Stat(credentialsFile)
-	assert.Error(t, err)
+	assert.NoFileExists(t, credentialsFile)
 
 	client, err := getSftpClient(user, usePubKey)
 	if assert.NoError(t, err) {
@@ -1359,7 +1371,7 @@ func TestLoginInvalidFs(t *testing.T) {
 	u := getTestUser(usePubKey)
 	u.FsConfig.Provider = dataprovider.GCSFilesystemProvider
 	u.FsConfig.GCSConfig.Bucket = "test"
-	u.FsConfig.GCSConfig.Credentials = []byte("invalid JSON for credentials")
+	u.FsConfig.GCSConfig.Credentials = kms.NewPlainSecret("invalid JSON for credentials")
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
 
@@ -2189,7 +2201,7 @@ func TestQuotaFileReplace(t *testing.T) {
 	testFileSize := int64(65535)
 	testFilePath := filepath.Join(homeBasePath, testFileName)
 	client, err := getSftpClient(user, usePubKey)
-	if assert.NoError(t, err) {
+	if assert.NoError(t, err) { //nolint:dupl
 		defer client.Close()
 		expectedQuotaSize := user.UsedQuotaSize + testFileSize
 		expectedQuotaFiles := user.UsedQuotaFiles + 1
@@ -2555,7 +2567,8 @@ func TestBandwidthAndConnections(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestExtensionsFilters(t *testing.T) {
+//nolint:dupl
+func TestPatternsFilters(t *testing.T) {
 	usePubKey := true
 	u := getTestUser(usePubKey)
 	user, _, err := httpd.AddUser(u, http.StatusOK)
@@ -2570,12 +2583,14 @@ func TestExtensionsFilters(t *testing.T) {
 		assert.NoError(t, err)
 		err = sftpUploadFile(testFilePath, testFileName, testFileSize, client)
 		assert.NoError(t, err)
+		err = sftpUploadFile(testFilePath, testFileName+".zip", testFileSize, client)
+		assert.NoError(t, err)
 	}
-	user.Filters.FileExtensions = []dataprovider.ExtensionsFilter{
+	user.Filters.FilePatterns = []dataprovider.PatternsFilter{
 		{
-			Path:              "/",
-			AllowedExtensions: []string{".zip"},
-			DeniedExtensions:  []string{},
+			Path:            "/",
+			AllowedPatterns: []string{"*.zIp"},
+			DeniedPatterns:  []string{},
 		},
 	}
 	_, _, err = httpd.UpdateUser(user, http.StatusOK, "")
@@ -2591,6 +2606,75 @@ func TestExtensionsFilters(t *testing.T) {
 		assert.Error(t, err)
 		err = client.Remove(testFileName)
 		assert.Error(t, err)
+		err = sftpDownloadFile(testFileName+".zip", localDownloadPath, testFileSize, client)
+		assert.NoError(t, err)
+		err = client.Mkdir("dir.zip")
+		assert.NoError(t, err)
+		err = client.Rename("dir.zip", "dir1.zip")
+		assert.NoError(t, err)
+	}
+	_, err = httpd.RemoveUser(user, http.StatusOK)
+	assert.NoError(t, err)
+	err = os.Remove(testFilePath)
+	assert.NoError(t, err)
+	err = os.Remove(localDownloadPath)
+	assert.NoError(t, err)
+	err = os.RemoveAll(user.GetHomeDir())
+	assert.NoError(t, err)
+}
+
+//nolint:dupl
+func TestExtensionsFilters(t *testing.T) {
+	usePubKey := true
+	u := getTestUser(usePubKey)
+	user, _, err := httpd.AddUser(u, http.StatusOK)
+	assert.NoError(t, err)
+	testFileSize := int64(131072)
+	testFilePath := filepath.Join(homeBasePath, testFileName)
+	localDownloadPath := filepath.Join(homeBasePath, testDLFileName)
+	client, err := getSftpClient(user, usePubKey)
+	if assert.NoError(t, err) {
+		defer client.Close()
+		err = createTestFile(testFilePath, testFileSize)
+		assert.NoError(t, err)
+		err = sftpUploadFile(testFilePath, testFileName, testFileSize, client)
+		assert.NoError(t, err)
+		err = sftpUploadFile(testFilePath, testFileName+".zip", testFileSize, client)
+		assert.NoError(t, err)
+		err = sftpUploadFile(testFilePath, testFileName+".jpg", testFileSize, client)
+		assert.NoError(t, err)
+	}
+	user.Filters.FileExtensions = []dataprovider.ExtensionsFilter{
+		{
+			Path:              "/",
+			AllowedExtensions: []string{".zIp", ".jPg"},
+			DeniedExtensions:  []string{},
+		},
+	}
+	user.Filters.FilePatterns = []dataprovider.PatternsFilter{
+		{
+			Path:            "/",
+			AllowedPatterns: []string{"*.jPg", "*.zIp"},
+			DeniedPatterns:  []string{},
+		},
+	}
+	_, _, err = httpd.UpdateUser(user, http.StatusOK, "")
+	assert.NoError(t, err)
+	client, err = getSftpClient(user, usePubKey)
+	if assert.NoError(t, err) {
+		defer client.Close()
+		err = sftpUploadFile(testFilePath, testFileName, testFileSize, client)
+		assert.Error(t, err)
+		err = sftpDownloadFile(testFileName, localDownloadPath, testFileSize, client)
+		assert.Error(t, err)
+		err = client.Rename(testFileName, testFileName+"1")
+		assert.Error(t, err)
+		err = client.Remove(testFileName)
+		assert.Error(t, err)
+		err = sftpDownloadFile(testFileName+".zip", localDownloadPath, testFileSize, client)
+		assert.NoError(t, err)
+		err = sftpDownloadFile(testFileName+".jpg", localDownloadPath, testFileSize, client)
+		assert.NoError(t, err)
 		err = client.Mkdir("dir.zip")
 		assert.NoError(t, err)
 		err = client.Rename("dir.zip", "dir1.zip")
@@ -5689,7 +5773,7 @@ func TestResolveVirtualPaths(t *testing.T) {
 	})
 	err := os.MkdirAll(mappedPath, os.ModePerm)
 	assert.NoError(t, err)
-	osFs := vfs.NewOsFs("", user.GetHomeDir(), user.VirtualFolders).(vfs.OsFs)
+	osFs := vfs.NewOsFs("", user.GetHomeDir(), user.VirtualFolders).(*vfs.OsFs)
 	b, f := osFs.GetFsPaths("/vdir/a.txt")
 	assert.Equal(t, mappedPath, b)
 	assert.Equal(t, filepath.Join(mappedPath, "a.txt"), f)
@@ -5732,6 +5816,44 @@ func TestUserPerms(t *testing.T) {
 	assert.True(t, user.HasPerm(dataprovider.PermDownload, "/p/1/test/file.dat"))
 }
 
+//nolint:dupl
+func TestFilterFilePatterns(t *testing.T) {
+	user := getTestUser(true)
+	pattern := dataprovider.PatternsFilter{
+		Path:            "/test",
+		AllowedPatterns: []string{"*.jpg", "*.png"},
+		DeniedPatterns:  []string{"*.pdf"},
+	}
+	filters := dataprovider.UserFilters{
+		FilePatterns: []dataprovider.PatternsFilter{pattern},
+	}
+	user.Filters = filters
+	assert.True(t, user.IsFileAllowed("/test/test.jPg"))
+	assert.False(t, user.IsFileAllowed("/test/test.pdf"))
+	assert.True(t, user.IsFileAllowed("/test.pDf"))
+
+	filters.FilePatterns = append(filters.FilePatterns, dataprovider.PatternsFilter{
+		Path:            "/",
+		AllowedPatterns: []string{"*.zip", "*.rar", "*.pdf"},
+		DeniedPatterns:  []string{"*.gz"},
+	})
+	user.Filters = filters
+	assert.False(t, user.IsFileAllowed("/test1/test.gz"))
+	assert.True(t, user.IsFileAllowed("/test1/test.zip"))
+	assert.False(t, user.IsFileAllowed("/test/sub/test.pdf"))
+	assert.False(t, user.IsFileAllowed("/test1/test.png"))
+
+	filters.FilePatterns = append(filters.FilePatterns, dataprovider.PatternsFilter{
+		Path:           "/test/sub",
+		DeniedPatterns: []string{"*.tar"},
+	})
+	user.Filters = filters
+	assert.False(t, user.IsFileAllowed("/test/sub/sub/test.tar"))
+	assert.True(t, user.IsFileAllowed("/test/sub/test.gz"))
+	assert.False(t, user.IsFileAllowed("/test/test.zip"))
+}
+
+//nolint:dupl
 func TestFilterFileExtensions(t *testing.T) {
 	user := getTestUser(true)
 	extension := dataprovider.ExtensionsFilter{
@@ -6810,6 +6932,8 @@ func TestSCPBasicHandling(t *testing.T) {
 	_, err = httpd.RemoveUser(user, http.StatusOK)
 	assert.NoError(t, err)
 	err = os.Remove(testFilePath)
+	assert.NoError(t, err)
+	err = os.RemoveAll(user.GetHomeDir())
 	assert.NoError(t, err)
 }
 

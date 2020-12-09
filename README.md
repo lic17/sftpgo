@@ -4,6 +4,7 @@
 [![Code Coverage](https://codecov.io/gh/drakkan/sftpgo/branch/master/graph/badge.svg)](https://codecov.io/gh/drakkan/sftpgo/branch/master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/drakkan/sftpgo)](https://goreportcard.com/report/github.com/drakkan/sftpgo)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Docker Pulls](https://img.shields.io/docker/pulls/drakkan/sftpgo)](https://hub.docker.com/r/drakkan/sftpgo)
 [![Mentioned in Awesome Go](https://awesome.re/mentioned-badge.svg)](https://github.com/avelino/awesome-go)
 
 Fully featured and highly configurable SFTP server with optional FTP/S and WebDAV support, written in Go.
@@ -20,6 +21,7 @@ It can serve local filesystem, S3 (compatible) Object Storage, Google Cloud Stor
 - Partial authentication. You can configure multi-step authentication requiring, for example, the user password after successful public key authentication.
 - Per user authentication methods. You can configure the allowed authentication methods for each user.
 - Custom authentication via external programs/HTTP API is supported.
+- [Data At Rest Encryption](./docs/dare.md) is supported.
 - Dynamic user modification before login via external programs/HTTP API is supported.
 - Quota support: accounts can have individual quota expressed as max total size and/or max number of files.
 - Bandwidth throttling is supported, with distinct settings for upload and download.
@@ -27,7 +29,7 @@ It can serve local filesystem, S3 (compatible) Object Storage, Google Cloud Stor
 - Per user and per directory permission management: list directory contents, upload, overwrite, download, delete, rename, create directories, create symlinks, change owner/group and mode, change access and modification times.
 - Per user files/folders ownership mapping: you can map all the users to the system account that runs SFTPGo (all platforms are supported) or you can run SFTPGo as root user and map each user or group of users to a different system account (\*NIX only).
 - Per user IP filters are supported: login can be restricted to specific ranges of IP addresses or to a specific IP address.
-- Per user and per directory file extensions filters are supported: files can be allowed or denied based on their extensions.
+- Per user and per directory shell like patterns filters are supported: files can be allowed or denied based on shell like patterns.
 - Virtual folders are supported: directories outside the user home directory can be exposed as virtual folders.
 - Configurable custom commands and/or HTTP notifications on file upload, download, pre-delete, delete, rename, on SSH commands and on user add, update and delete.
 - Automatically terminating idle connections.
@@ -82,7 +84,7 @@ Alternately, you can [build from source](./docs/build-from-source.md).
 
 A full explanation of all configuration methods can be found [here](./docs/full-configuration.md).
 
-Please make sure to [initialize the data provider](#data-provider-initialization) before running the daemon!
+Please make sure to [initialize the data provider](#data-provider-initialization-and-management) before running the daemon!
 
 To start SFTPGo with the default settings, simply run:
 
@@ -92,7 +94,7 @@ sftpgo serve
 
 Check out [this documentation](./docs/service.md) if you want to run SFTPGo as a service.
 
-### Data provider initialization and update
+### Data provider initialization and management
 
 Before starting the SFTPGo server please ensure that the configured data provider is properly initialized/updated.
 
@@ -117,6 +119,27 @@ sftpgo initprovider --help
 ```
 
 You can disable automatic data provider checks/updates at startup by setting the `update_mode` configuration key to `1`.
+
+If for some reason you want to downgrade SFTPGo, you may need to downgrade your data provider schema and data as well. You can use the `revertprovider` command for this task.
+
+We support the follwing schema versions:
+
+- `6`, this is the current git master
+- `4`, this is the schema for v1.0.0-v1.2.x
+
+So, if you plan to downgrade from git master to 1.2.x, you can prepare your data provider executing the following command from the configuration directory:
+
+```shell
+sftpgo revertprovider --to-version 4
+```
+
+Take a look at the CLI usage to learn how to specify a different configuration file:
+
+```bash
+sftpgo revertprovider --help
+```
+
+The `revertprovider` command is not supported for the memory provider.
 
 ## Users and folders management
 

@@ -1,7 +1,6 @@
 package dataprovider
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -42,7 +41,7 @@ type MemoryProvider struct {
 	dbHandle *memoryProviderHandle
 }
 
-func initializeMemoryProvider(basePath string) error {
+func initializeMemoryProvider(basePath string) {
 	logSender = fmt.Sprintf("dataprovider_%v", MemoryDataProviderName)
 	configFile := ""
 	if utils.IsFileInputValid(config.Name) {
@@ -62,7 +61,10 @@ func initializeMemoryProvider(basePath string) error {
 			configFile:    configFile,
 		},
 	}
-	return provider.reloadConfig()
+	if err := provider.reloadConfig(); err != nil {
+		logger.Error(logSender, "", "unable to load initial data: %v", err)
+		logger.ErrorToConsole("unable to load initial data: %v", err)
+	}
 }
 
 func (p MemoryProvider) checkAvailability() error {
@@ -262,7 +264,8 @@ func (p MemoryProvider) dumpUsers() ([]User, error) {
 		return users, errMemoryProviderClosed
 	}
 	for _, username := range p.dbHandle.usernames {
-		user := p.dbHandle.users[username]
+		u := p.dbHandle.users[username]
+		user := u.getACopy()
 		err = addCredentialsToUser(&user)
 		if err != nil {
 			return users, err
@@ -300,7 +303,8 @@ func (p MemoryProvider) getUsers(limit int, offset int, order string, username s
 		if offset == 0 {
 			user, err := p.userExistsInternal(username)
 			if err == nil {
-				users = append(users, HideUserSensitiveData(&user))
+				user.HideConfidentialData()
+				users = append(users, user)
 			}
 		}
 		return users, err
@@ -312,8 +316,10 @@ func (p MemoryProvider) getUsers(limit int, offset int, order string, username s
 			if itNum <= offset {
 				continue
 			}
-			user := p.dbHandle.users[username]
-			users = append(users, HideUserSensitiveData(&user))
+			u := p.dbHandle.users[username]
+			user := u.getACopy()
+			user.HideConfidentialData()
+			users = append(users, user)
 			if len(users) >= limit {
 				break
 			}
@@ -325,8 +331,10 @@ func (p MemoryProvider) getUsers(limit int, offset int, order string, username s
 				continue
 			}
 			username := p.dbHandle.usernames[i]
-			user := p.dbHandle.users[username]
-			users = append(users, HideUserSensitiveData(&user))
+			u := p.dbHandle.users[username]
+			user := u.getACopy()
+			user.HideConfidentialData()
+			users = append(users, user)
 			if len(users) >= limit {
 				break
 			}
@@ -599,7 +607,7 @@ func (p MemoryProvider) clear() {
 }
 
 func (p MemoryProvider) reloadConfig() error {
-	if len(p.dbHandle.configFile) == 0 {
+	if p.dbHandle.configFile == "" {
 		providerLog(logger.LevelDebug, "no users configuration file defined")
 		return nil
 	}
@@ -624,8 +632,7 @@ func (p MemoryProvider) reloadConfig() error {
 		providerLog(logger.LevelWarn, "error loading users: %v", err)
 		return err
 	}
-	var dump BackupData
-	err = json.Unmarshal(content, &dump)
+	dump, err := ParseDumpData(content)
 	if err != nil {
 		providerLog(logger.LevelWarn, "error loading users: %v", err)
 		return err
@@ -672,4 +679,8 @@ func (p MemoryProvider) initializeDatabase() error {
 
 func (p MemoryProvider) migrateDatabase() error {
 	return ErrNoInitRequired
+}
+
+func (p MemoryProvider) revertDatabase(targetVersion int) error {
+	return errors.New("memory provider does not store data, revert not possible")
 }

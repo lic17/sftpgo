@@ -15,9 +15,11 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/drakkan/sftpgo/dataprovider"
 	"github.com/drakkan/sftpgo/httpclient"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/logger"
 	"github.com/drakkan/sftpgo/vfs"
 )
@@ -185,29 +187,42 @@ func TestSSHConnections(t *testing.T) {
 	now := time.Now()
 	sshConn1 := NewSSHConnection("id1", conn1)
 	sshConn2 := NewSSHConnection("id2", conn2)
+	sshConn3 := NewSSHConnection("id3", conn2)
 	assert.Equal(t, "id1", sshConn1.GetID())
 	assert.Equal(t, "id2", sshConn2.GetID())
+	assert.Equal(t, "id3", sshConn3.GetID())
 	sshConn1.UpdateLastActivity()
 	assert.GreaterOrEqual(t, sshConn1.GetLastActivity().UnixNano(), now.UnixNano())
 	Connections.AddSSHConnection(sshConn1)
 	Connections.AddSSHConnection(sshConn2)
+	Connections.AddSSHConnection(sshConn3)
+	Connections.RLock()
+	assert.Len(t, Connections.sshConnections, 3)
+	Connections.RUnlock()
+	Connections.RemoveSSHConnection(sshConn1.id)
 	Connections.RLock()
 	assert.Len(t, Connections.sshConnections, 2)
+	assert.Equal(t, sshConn3.id, Connections.sshConnections[0].id)
+	assert.Equal(t, sshConn2.id, Connections.sshConnections[1].id)
 	Connections.RUnlock()
 	Connections.RemoveSSHConnection(sshConn1.id)
 	Connections.RLock()
-	assert.Len(t, Connections.sshConnections, 1)
-	Connections.RUnlock()
-	Connections.RemoveSSHConnection(sshConn1.id)
-	Connections.RLock()
-	assert.Len(t, Connections.sshConnections, 1)
+	assert.Len(t, Connections.sshConnections, 2)
+	assert.Equal(t, sshConn3.id, Connections.sshConnections[0].id)
+	assert.Equal(t, sshConn2.id, Connections.sshConnections[1].id)
 	Connections.RUnlock()
 	Connections.RemoveSSHConnection(sshConn2.id)
+	Connections.RLock()
+	assert.Len(t, Connections.sshConnections, 1)
+	assert.Equal(t, sshConn3.id, Connections.sshConnections[0].id)
+	Connections.RUnlock()
+	Connections.RemoveSSHConnection(sshConn3.id)
 	Connections.RLock()
 	assert.Len(t, Connections.sshConnections, 0)
 	Connections.RUnlock()
 	assert.NoError(t, sshConn1.Close())
 	assert.NoError(t, sshConn2.Close())
+	assert.NoError(t, sshConn3.Close())
 }
 
 func TestIdleConnections(t *testing.T) {
@@ -412,7 +427,14 @@ func TestConnectionStatus(t *testing.T) {
 	assert.Error(t, err)
 
 	Connections.Remove(fakeConn1.GetID())
+	stats = Connections.GetStats()
+	assert.Len(t, stats, 2)
+	assert.Equal(t, fakeConn3.GetID(), stats[0].ConnectionID)
+	assert.Equal(t, fakeConn2.GetID(), stats[1].ConnectionID)
 	Connections.Remove(fakeConn2.GetID())
+	stats = Connections.GetStats()
+	assert.Len(t, stats, 1)
+	assert.Equal(t, fakeConn3.GetID(), stats[0].ConnectionID)
 	Connections.Remove(fakeConn3.GetID())
 	stats = Connections.GetStats()
 	assert.Len(t, stats, 0)
@@ -513,4 +535,19 @@ func TestPostConnectHook(t *testing.T) {
 	}
 
 	Config.PostConnectHook = ""
+}
+
+func TestCryptoConvertFileInfo(t *testing.T) {
+	name := "name"
+	fs, err := vfs.NewCryptFs("connID1", os.TempDir(), vfs.CryptFsConfig{Passphrase: kms.NewPlainSecret("secret")})
+	require.NoError(t, err)
+	cryptFs := fs.(*vfs.CryptFs)
+	info := vfs.NewFileInfo(name, true, 48, time.Now(), false)
+	assert.Equal(t, info, cryptFs.ConvertFileInfo(info))
+	info = vfs.NewFileInfo(name, false, 48, time.Now(), false)
+	assert.NotEqual(t, info.Size(), cryptFs.ConvertFileInfo(info).Size())
+	info = vfs.NewFileInfo(name, false, 33, time.Now(), false)
+	assert.Equal(t, int64(0), cryptFs.ConvertFileInfo(info).Size())
+	info = vfs.NewFileInfo(name, false, 1, time.Now(), false)
+	assert.Equal(t, int64(0), cryptFs.ConvertFileInfo(info).Size())
 }

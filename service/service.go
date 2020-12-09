@@ -2,7 +2,7 @@
 package service
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -65,21 +65,35 @@ func (s *Service) Start() error {
 		}
 	}
 	logger.Info(logSender, "", "starting SFTPGo %v, config dir: %v, config file: %v, log max size: %v log max backups: %v "+
-		"log max age: %v log verbose: %v, log compress: %v, profile: %v", version.GetAsString(), s.ConfigDir, s.ConfigFile,
-		s.LogMaxSize, s.LogMaxBackups, s.LogMaxAge, s.LogVerbose, s.LogCompress, s.Profiler)
+		"log max age: %v log verbose: %v, log compress: %v, profile: %v load data from: %#v", version.GetAsString(), s.ConfigDir, s.ConfigFile,
+		s.LogMaxSize, s.LogMaxBackups, s.LogMaxAge, s.LogVerbose, s.LogCompress, s.Profiler, s.LoadDataFrom)
 	// in portable mode we don't read configuration from file
 	if s.PortableMode != 1 {
 		err := config.LoadConfig(s.ConfigDir, s.ConfigFile)
 		if err != nil {
 			logger.Error(logSender, "", "error loading configuration: %v", err)
+			return err
 		}
+	}
+	if !config.HasServicesToStart() {
+		infoString := "No service configured, nothing to do"
+		logger.Info(logSender, "", infoString)
+		logger.InfoToConsole(infoString)
+		return errors.New(infoString)
 	}
 
 	common.Initialize(config.GetCommonConfig())
+	kmsConfig := config.GetKMSConfig()
+	err := kmsConfig.Initialize()
+	if err != nil {
+		logger.Error(logSender, "", "unable to initialize KMS: %v", err)
+		logger.ErrorToConsole("unable to initialize KMS: %v", err)
+		os.Exit(1)
+	}
 
 	providerConf := config.GetProviderConf()
 
-	err := dataprovider.Initialize(providerConf, s.ConfigDir)
+	err = dataprovider.Initialize(providerConf, s.ConfigDir)
 	if err != nil {
 		logger.Error(logSender, "", "error initializing data provider: %v", err)
 		logger.ErrorToConsole("error initializing data provider: %v", err)
@@ -99,7 +113,6 @@ func (s *Service) Start() error {
 	if err != nil {
 		logger.Error(logSender, "", "unable to load initial data: %v", err)
 		logger.ErrorToConsole("unable to load initial data: %v", err)
-		return err
 	}
 
 	httpConfig := config.GetHTTPConfig()
@@ -116,15 +129,19 @@ func (s *Service) startServices() {
 	httpdConf := config.GetHTTPDConfig()
 	webDavDConf := config.GetWebDAVDConfig()
 
-	go func() {
-		logger.Debug(logSender, "", "initializing SFTP server with config %+v", sftpdConf)
-		if err := sftpdConf.Initialize(s.ConfigDir); err != nil {
-			logger.Error(logSender, "", "could not start SFTP server: %v", err)
-			logger.ErrorToConsole("could not start SFTP server: %v", err)
-			s.Error = err
-		}
-		s.Shutdown <- true
-	}()
+	if sftpdConf.BindPort > 0 {
+		go func() {
+			logger.Debug(logSender, "", "initializing SFTP server with config %+v", sftpdConf)
+			if err := sftpdConf.Initialize(s.ConfigDir); err != nil {
+				logger.Error(logSender, "", "could not start SFTP server: %v", err)
+				logger.ErrorToConsole("could not start SFTP server: %v", err)
+				s.Error = err
+			}
+			s.Shutdown <- true
+		}()
+	} else {
+		logger.Debug(logSender, "", "SFTP server not started, disabled in config file")
+	}
 
 	if httpdConf.BindPort > 0 {
 		go func() {
@@ -163,7 +180,7 @@ func (s *Service) startServices() {
 			s.Shutdown <- true
 		}()
 	} else {
-		logger.Debug(logSender, "", "WevDAV server not started, disabled in config file")
+		logger.Debug(logSender, "", "WebDAV server not started, disabled in config file")
 	}
 }
 
@@ -207,9 +224,7 @@ func (s *Service) loadInitialData() error {
 	if err != nil {
 		return fmt.Errorf("unable to read input file %#v: %v", s.LoadDataFrom, err)
 	}
-	var dump dataprovider.BackupData
-
-	err = json.Unmarshal(content, &dump)
+	dump, err := dataprovider.ParseDumpData(content)
 	if err != nil {
 		return fmt.Errorf("unable to parse file to restore %#v: %v", s.LoadDataFrom, err)
 	}
@@ -221,8 +236,10 @@ func (s *Service) loadInitialData() error {
 	if err != nil {
 		return fmt.Errorf("unable to restore users from file %#v: %v", s.LoadDataFrom, err)
 	}
-	logger.Info(logSender, "", "data loaded from file %#v", s.LoadDataFrom)
-	logger.InfoToConsole("data loaded from file %#v", s.LoadDataFrom)
+	logger.Info(logSender, "", "data loaded from file %#v mode: %v, quota scan %v", s.LoadDataFrom,
+		s.LoadDataMode, s.LoadDataQuotaScan)
+	logger.InfoToConsole("data loaded from file %#v mode: %v, quota scan %v", s.LoadDataFrom,
+		s.LoadDataMode, s.LoadDataQuotaScan)
 	if s.LoadDataClean {
 		err = os.Remove(s.LoadDataFrom)
 		if err == nil {

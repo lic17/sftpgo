@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -127,7 +128,7 @@ func (e *authenticationError) Error() string {
 }
 
 // Initialize the SFTP server and add a persistent listener to handle inbound SFTP connections.
-func (c Configuration) Initialize(configDir string) error {
+func (c *Configuration) Initialize(configDir string) error {
 	serverConfig := &ssh.ServerConfig{
 		NoClientAuth: false,
 		MaxAuthTries: c.MaxAuthTries,
@@ -165,6 +166,7 @@ func (c Configuration) Initialize(configDir string) error {
 	}
 
 	if err := c.checkAndLoadHostKeys(configDir, serverConfig); err != nil {
+		serviceStatus.HostKeys = nil
 		return err
 	}
 
@@ -179,7 +181,8 @@ func (c Configuration) Initialize(configDir string) error {
 	c.configureLoginBanner(serverConfig, configDir)
 	c.checkSSHCommands()
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", c.BindAddress, c.BindPort))
+	addr := fmt.Sprintf("%s:%d", c.BindAddress, c.BindPort)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		logger.Warn(logSender, "", "error starting listener on address %s:%d: %v", c.BindAddress, c.BindPort, err)
 		return err
@@ -190,6 +193,9 @@ func (c Configuration) Initialize(configDir string) error {
 		return err
 	}
 	logger.Info(logSender, "", "server listener registered address: %v", listener.Addr().String())
+	serviceStatus.Address = addr
+	serviceStatus.IsActive = true
+	serviceStatus.SSHCommands = strings.Join(c.EnabledSSHCommands, ", ")
 
 	for {
 		var conn net.Conn
@@ -204,7 +210,7 @@ func (c Configuration) Initialize(configDir string) error {
 	}
 }
 
-func (c Configuration) configureSecurityOptions(serverConfig *ssh.ServerConfig) {
+func (c *Configuration) configureSecurityOptions(serverConfig *ssh.ServerConfig) {
 	if len(c.KexAlgorithms) > 0 {
 		serverConfig.KeyExchanges = c.KexAlgorithms
 	}
@@ -216,7 +222,7 @@ func (c Configuration) configureSecurityOptions(serverConfig *ssh.ServerConfig) 
 	}
 }
 
-func (c Configuration) configureLoginBanner(serverConfig *ssh.ServerConfig, configDir string) {
+func (c *Configuration) configureLoginBanner(serverConfig *ssh.ServerConfig, configDir string) {
 	if len(c.LoginBannerFile) > 0 {
 		bannerFilePath := c.LoginBannerFile
 		if !filepath.IsAbs(bannerFilePath) {
@@ -235,7 +241,7 @@ func (c Configuration) configureLoginBanner(serverConfig *ssh.ServerConfig, conf
 	}
 }
 
-func (c Configuration) configureKeyboardInteractiveAuth(serverConfig *ssh.ServerConfig) {
+func (c *Configuration) configureKeyboardInteractiveAuth(serverConfig *ssh.ServerConfig) {
 	if len(c.KeyboardInteractiveHook) == 0 {
 		return
 	}
@@ -265,7 +271,12 @@ func (c Configuration) configureKeyboardInteractiveAuth(serverConfig *ssh.Server
 }
 
 // AcceptInboundConnection handles an inbound connection to the server instance and determines if the request should be served or not.
-func (c Configuration) AcceptInboundConnection(conn net.Conn, config *ssh.ServerConfig) {
+func (c *Configuration) AcceptInboundConnection(conn net.Conn, config *ssh.ServerConfig) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(logSender, "", "panic in AcceptInboundConnection: %#v stack strace: %v", r, string(debug.Stack()))
+		}
+	}()
 	// Before beginning a handshake must be performed on the incoming net.Conn
 	// we'll set a Deadline for handshake to complete, the default is 2 minutes as OpenSSH
 	conn.SetDeadline(time.Now().Add(handshakeTimeout)) //nolint:errcheck
@@ -373,7 +384,12 @@ func (c Configuration) AcceptInboundConnection(conn net.Conn, config *ssh.Server
 	}
 }
 
-func (c Configuration) handleSftpConnection(channel ssh.Channel, connection *Connection) {
+func (c *Configuration) handleSftpConnection(channel ssh.Channel, connection *Connection) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error(logSender, "", "panic in handleSftpConnection: %#v stack strace: %v", r, string(debug.Stack()))
+		}
+	}()
 	common.Connections.Add(connection)
 	defer common.Connections.Remove(connection.GetID())
 
@@ -383,18 +399,18 @@ func (c Configuration) handleSftpConnection(channel ssh.Channel, connection *Con
 	// Create the server instance for the channel using the handler we created above.
 	server := sftp.NewRequestServer(channel, handler, sftp.WithRSAllocator())
 
+	defer server.Close()
 	if err := server.Serve(); err == io.EOF {
 		connection.Log(logger.LevelDebug, "connection closed, sending exit status")
 		exitStatus := sshSubsystemExitStatus{Status: uint32(0)}
 		_, err = channel.SendRequest("exit-status", false, ssh.Marshal(&exitStatus))
 		connection.Log(logger.LevelDebug, "sent exit status %+v error: %v", exitStatus, err)
-		server.Close()
 	} else if err != nil {
 		connection.Log(logger.LevelWarn, "connection closed with error: %v", err)
 	}
 }
 
-func (c Configuration) createHandler(connection *Connection) sftp.Handlers {
+func (c *Configuration) createHandler(connection *Connection) sftp.Handlers {
 	return sftp.Handlers{
 		FileGet:  connection,
 		FilePut:  connection,
@@ -552,8 +568,8 @@ func (c *Configuration) checkAndLoadHostKeys(configDir string, serverConfig *ssh
 	if err := c.checkHostKeyAutoGeneration(configDir); err != nil {
 		return err
 	}
-	for _, k := range c.HostKeys {
-		hostKey := k
+	serviceStatus.HostKeys = nil
+	for _, hostKey := range c.HostKeys {
 		if !utils.IsFileInputValid(hostKey) {
 			logger.Warn(logSender, "", "unable to load invalid host key %#v", hostKey)
 			logger.WarnToConsole("unable to load invalid host key %#v", hostKey)
@@ -573,8 +589,13 @@ func (c *Configuration) checkAndLoadHostKeys(configDir string, serverConfig *ssh
 		if err != nil {
 			return err
 		}
+		k := HostKey{
+			Path:        hostKey,
+			Fingerprint: ssh.FingerprintSHA256(private.PublicKey()),
+		}
+		serviceStatus.HostKeys = append(serviceStatus.HostKeys, k)
 		logger.Info(logSender, "", "Host key %#v loaded, type %#v, fingerprint %#v", hostKey,
-			private.PublicKey().Type(), ssh.FingerprintSHA256(private.PublicKey()))
+			private.PublicKey().Type(), k.Fingerprint)
 
 		// Add private key to the server configuration.
 		serverConfig.AddHostKey(private)
@@ -622,7 +643,7 @@ func (c *Configuration) initializeCertChecker(configDir string) error {
 	return nil
 }
 
-func (c Configuration) validatePublicKeyCredentials(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
+func (c *Configuration) validatePublicKeyCredentials(conn ssh.ConnMetadata, pubKey ssh.PublicKey) (*ssh.Permissions, error) {
 	var err error
 	var user dataprovider.User
 	var keyID string
@@ -671,7 +692,7 @@ func (c Configuration) validatePublicKeyCredentials(conn ssh.ConnMetadata, pubKe
 	return sshPerm, err
 }
 
-func (c Configuration) validatePasswordCredentials(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+func (c *Configuration) validatePasswordCredentials(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 	var err error
 	var user dataprovider.User
 	var sshPerm *ssh.Permissions
@@ -688,7 +709,7 @@ func (c Configuration) validatePasswordCredentials(conn ssh.ConnMetadata, pass [
 	return sshPerm, err
 }
 
-func (c Configuration) validateKeyboardInteractiveCredentials(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
+func (c *Configuration) validateKeyboardInteractiveCredentials(conn ssh.ConnMetadata, client ssh.KeyboardInteractiveChallenge) (*ssh.Permissions, error) {
 	var err error
 	var user dataprovider.User
 	var sshPerm *ssh.Permissions

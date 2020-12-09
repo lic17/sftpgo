@@ -23,6 +23,13 @@ var (
 	server *webDavServer
 )
 
+// ServiceStatus defines the service status
+type ServiceStatus struct {
+	IsActive bool   `json:"is_active"`
+	Address  string `json:"address"`
+	Protocol string `json:"protocol"`
+}
+
 // Cors configuration
 type Cors struct {
 	AllowedOrigins   []string `json:"allowed_origins" mapstructure:"allowed_origins"`
@@ -34,11 +41,22 @@ type Cors struct {
 	MaxAge           int      `json:"max_age" mapstructure:"max_age"`
 }
 
+// UsersCacheConfig defines the cache configuration for users
+type UsersCacheConfig struct {
+	ExpirationTime int `json:"expiration_time" mapstructure:"expiration_time"`
+	MaxSize        int `json:"max_size" mapstructure:"max_size"`
+}
+
+// MimeCacheConfig defines the cache configuration for mime types
+type MimeCacheConfig struct {
+	Enabled bool `json:"enabled" mapstructure:"enabled"`
+	MaxSize int  `json:"max_size" mapstructure:"max_size"`
+}
+
 // Cache configuration
 type Cache struct {
-	Enabled        bool `json:"enabled" mapstructure:"enabled"`
-	ExpirationTime int  `json:"expiration_time" mapstructure:"expiration_time"`
-	MaxSize        int  `json:"max_size" mapstructure:"max_size"`
+	Users     UsersCacheConfig `json:"users" mapstructure:"users"`
+	MimeTypes MimeCacheConfig  `json:"mime_types" mapstructure:"mime_types"`
 }
 
 // Configuration defines the configuration for the WevDAV server
@@ -59,10 +77,25 @@ type Configuration struct {
 	Cache Cache `json:"cache" mapstructure:"cache"`
 }
 
-// Initialize configures and starts the WebDav server
+// GetStatus returns the server status
+func GetStatus() ServiceStatus {
+	if server == nil {
+		return ServiceStatus{}
+	}
+	return server.status
+}
+
+// Initialize configures and starts the WebDAV server
 func (c *Configuration) Initialize(configDir string) error {
 	var err error
-	logger.Debug(logSender, "", "initializing WevDav server with config %+v", *c)
+	logger.Debug(logSender, "", "initializing WebDAV server with config %+v", *c)
+	mimeTypeCache = mimeCache{
+		maxSize:   c.Cache.MimeTypes.MaxSize,
+		mimeTypes: make(map[string]string),
+	}
+	if !c.Cache.MimeTypes.Enabled {
+		mimeTypeCache.maxSize = 0
+	}
 	server, err = newServer(c, configDir)
 	if err != nil {
 		return err

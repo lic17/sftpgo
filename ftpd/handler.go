@@ -99,7 +99,7 @@ func (c *Connection) Remove(name string) error {
 		return c.GetFsError(err)
 	}
 
-	if fi.IsDir() && fi.Mode()&os.ModeSymlink != os.ModeSymlink {
+	if fi.IsDir() && fi.Mode()&os.ModeSymlink == 0 {
 		c.Log(logger.LevelDebug, "cannot remove %#v is not a file/symlink", p)
 		return c.GetGenericError(nil)
 	}
@@ -307,7 +307,7 @@ func (c *Connection) uploadFile(fsPath, ftpPath string, flags int) (ftpserver.Fi
 	}
 
 	stat, statErr := c.Fs.Lstat(fsPath)
-	if (statErr == nil && stat.Mode()&os.ModeSymlink == os.ModeSymlink) || c.Fs.IsNotExist(statErr) {
+	if (statErr == nil && stat.Mode()&os.ModeSymlink != 0) || c.Fs.IsNotExist(statErr) {
 		if !c.User.HasPerm(dataprovider.PermUpload, path.Dir(ftpPath)) {
 			return nil, c.GetPermissionDeniedError()
 		}
@@ -365,7 +365,11 @@ func (c *Connection) handleFTPUploadToExistingFile(flags int, resolvedPath, file
 		return nil, common.ErrQuotaExceeded
 	}
 	minWriteOffset := int64(0)
-	isResume := flags&os.O_APPEND != 0 && flags&os.O_TRUNC == 0
+	// ftpserverlib set os.O_WRONLY | os.O_APPEND for APPE
+	// and os.O_WRONLY | os.O_CREATE for REST. If is not APPE
+	// and REST = 0 then os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	// so if we don't have O_TRUC is a resume
+	isResume := flags&os.O_TRUNC == 0
 	// if there is a size limit remaining size cannot be 0 here, since quotaResult.HasSpace
 	// will return false in this case and we deny the upload before
 	maxWriteSize, err := c.GetMaxWriteSize(quotaResult, isResume, fileSize)

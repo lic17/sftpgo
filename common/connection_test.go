@@ -9,11 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/minio/sio"
 	"github.com/pkg/sftp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/drakkan/sftpgo/dataprovider"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/vfs"
 )
 
@@ -459,6 +461,22 @@ func TestDoStat(t *testing.T) {
 	}
 	assert.False(t, os.SameFile(infoStat, infoLstat))
 
+	fs, err = vfs.NewCryptFs(fs.ConnectionID(), os.TempDir(), vfs.CryptFsConfig{
+		Passphrase: kms.NewPlainSecret("payload"),
+	})
+	assert.NoError(t, err)
+	conn = NewBaseConnection(fs.ConnectionID(), ProtocolFTP, u, fs)
+	dataSize := int64(32768)
+	data := make([]byte, dataSize)
+	err = ioutil.WriteFile(testFile, data, os.ModePerm)
+	assert.NoError(t, err)
+	infoStat, err = conn.DoStat(testFile, 0)
+	assert.NoError(t, err)
+	assert.Less(t, infoStat.Size(), dataSize)
+	encSize, err := sio.EncryptedSize(uint64(infoStat.Size()))
+	assert.NoError(t, err)
+	assert.Equal(t, int64(encSize)+33, dataSize)
+
 	err = os.Remove(testFile)
 	assert.NoError(t, err)
 	err = os.Remove(testFile + ".sym")
@@ -495,6 +513,29 @@ func TestSetStat(t *testing.T) {
 	c := NewBaseConnection("", ProtocolSFTP, user, fs)
 	err = c.SetStat(user.GetHomeDir(), "/", &StatAttributes{})
 	assert.NoError(t, err)
+
+	err = c.SetStat(dir2, "/dir1/file", &StatAttributes{
+		Mode:  os.ModePerm,
+		Flags: StatAttrPerms,
+	})
+	assert.NoError(t, err)
+	err = c.SetStat(dir1, "/dir2/file", &StatAttributes{
+		UID:   os.Getuid(),
+		GID:   os.Getgid(),
+		Flags: StatAttrUIDGID,
+	})
+	assert.NoError(t, err)
+	err = c.SetStat(dir1, "/dir3/file", &StatAttributes{
+		Atime: time.Now(),
+		Mtime: time.Now(),
+		Flags: StatAttrTimes,
+	})
+	assert.NoError(t, err)
+
+	Config.SetstatMode = 2
+	assert.False(t, c.ignoreSetStat())
+	c1 := NewBaseConnection("", ProtocolSFTP, user, newMockOsFs(false, fs.ConnectionID(), user.GetHomeDir()))
+	assert.True(t, c1.ignoreSetStat())
 
 	Config.SetstatMode = oldSetStatMode
 	// chmod
@@ -783,7 +824,7 @@ func TestRenamePermission(t *testing.T) {
 	}
 	info, err = os.Lstat(tmpDirLink)
 	if assert.NoError(t, err) {
-		assert.True(t, info.Mode()&os.ModeSymlink == os.ModeSymlink)
+		assert.True(t, info.Mode()&os.ModeSymlink != 0)
 		// the source is a symlink and the target has createDirs and upload perm
 		assert.False(t, conn.isRenamePermitted(tmpDir, request.Filepath, request.Target, info))
 	}
@@ -1145,6 +1186,12 @@ func TestErrorsMapping(t *testing.T) {
 			assert.EqualError(t, err, sftp.ErrSSHFxFailure.Error())
 		} else {
 			assert.EqualError(t, err, ErrPermissionDenied.Error())
+		}
+		err = conn.GetFsError(vfs.ErrVfsUnsupported)
+		if protocol == ProtocolSFTP {
+			assert.EqualError(t, err, sftp.ErrSSHFxOpUnsupported.Error())
+		} else {
+			assert.EqualError(t, err, ErrOpUnsupported.Error())
 		}
 		err = conn.GetFsError(nil)
 		assert.NoError(t, err)

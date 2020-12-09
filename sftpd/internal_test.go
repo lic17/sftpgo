@@ -397,17 +397,6 @@ func TestSFTPCmdTargetPath(t *testing.T) {
 	assert.True(t, os.IsNotExist(err))
 }
 
-func TestSetstatModeIgnore(t *testing.T) {
-	originalMode := common.Config.SetstatMode
-	common.Config.SetstatMode = 1
-	connection := Connection{}
-	request := sftp.NewRequest("Setstat", "invalid")
-	request.Flags = 0
-	err := connection.handleSFTPSetstat("invalid", request)
-	assert.NoError(t, err)
-	common.Config.SetstatMode = originalMode
-}
-
 func TestSFTPGetUsedQuota(t *testing.T) {
 	u := dataprovider.User{}
 	u.HomeDir = "home_rel_path"
@@ -1474,8 +1463,9 @@ func TestSCPDownloadFileData(t *testing.T) {
 		WriteError:   writeErr,
 	}
 	connection := &Connection{
-		BaseConnection: common.NewBaseConnection("", common.ProtocolSCP, dataprovider.User{}, nil),
-		channel:        &mockSSHChannelReadErr,
+		BaseConnection: common.NewBaseConnection("", common.ProtocolSCP, dataprovider.User{},
+			vfs.NewOsFs("", os.TempDir(), nil)),
+		channel: &mockSSHChannelReadErr,
 	}
 	scpCommand := scpCommand{
 		sshCommand: sshCommand{
@@ -1680,6 +1670,13 @@ func TestTransferFailingReader(t *testing.T) {
 	err = tr.Close()
 	assert.NoError(t, err)
 
+	tr = newTransfer(baseTransfer, nil, nil, errRead)
+	_, err = tr.ReadAt(buf, 0)
+	assert.EqualError(t, err, errRead.Error())
+
+	err = tr.Close()
+	assert.NoError(t, err)
+
 	err = os.Remove(fsPath)
 	assert.NoError(t, err)
 	assert.Len(t, connection.GetTransfers(), 0)
@@ -1845,4 +1842,29 @@ func TestSFTPSubSystem(t *testing.T) {
 	assert.Equal(t, n, 1)
 	err = subsystemChannel.Close()
 	assert.NoError(t, err)
+}
+
+func TestRecoverer(t *testing.T) {
+	c := Configuration{}
+	c.AcceptInboundConnection(nil, nil)
+	connID := "connectionID"
+	connection := &Connection{
+		BaseConnection: common.NewBaseConnection(connID, common.ProtocolSFTP, dataprovider.User{}, nil),
+	}
+	c.handleSftpConnection(nil, connection)
+	sshCmd := sshCommand{
+		command:    "cd",
+		connection: connection,
+	}
+	err := sshCmd.handle()
+	assert.EqualError(t, err, common.ErrGenericFailure.Error())
+	scpCmd := scpCommand{
+		sshCommand: sshCommand{
+			command:    "scp",
+			connection: connection,
+		},
+	}
+	err = scpCmd.handle()
+	assert.EqualError(t, err, common.ErrGenericFailure.Error())
+	assert.Len(t, common.Connections.GetStats(), 0)
 }

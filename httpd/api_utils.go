@@ -21,6 +21,7 @@ import (
 	"github.com/drakkan/sftpgo/common"
 	"github.com/drakkan/sftpgo/dataprovider"
 	"github.com/drakkan/sftpgo/httpclient"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/utils"
 	"github.com/drakkan/sftpgo/version"
 	"github.com/drakkan/sftpgo/vfs"
@@ -427,17 +428,17 @@ func GetVersion(expectedStatusCode int) (version.Info, []byte, error) {
 	return appVersion, body, err
 }
 
-// GetProviderStatus returns provider status
-func GetProviderStatus(expectedStatusCode int) (map[string]interface{}, []byte, error) {
-	var response map[string]interface{}
+// GetStatus returns the server status
+func GetStatus(expectedStatusCode int) (ServicesStatus, []byte, error) {
+	var response ServicesStatus
 	var body []byte
-	resp, err := sendHTTPRequest(http.MethodGet, buildURLRelativeToBase(providerStatusPath), nil, "")
+	resp, err := sendHTTPRequest(http.MethodGet, buildURLRelativeToBase(serverStatusPath), nil, "")
 	if err != nil {
 		return response, body, err
 	}
 	defer resp.Body.Close()
 	err = checkResponse(resp.StatusCode, expectedStatusCode)
-	if err == nil && (expectedStatusCode == http.StatusOK || expectedStatusCode == http.StatusInternalServerError) {
+	if err == nil && (expectedStatusCode == http.StatusOK) {
 		err = render.DecodeJSON(resp.Body, &response)
 	} else {
 		body, _ = getResponseBody(resp)
@@ -623,6 +624,9 @@ func compareUserFsConfig(expected *dataprovider.User, actual *dataprovider.User)
 	if err := compareAzBlobConfig(expected, actual); err != nil {
 		return err
 	}
+	if err := checkEncryptedSecret(expected.FsConfig.CryptConfig.Passphrase, actual.FsConfig.CryptConfig.Passphrase); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -704,31 +708,47 @@ func compareAzBlobConfig(expected *dataprovider.User, actual *dataprovider.User)
 	if expected.FsConfig.AzBlobConfig.UseEmulator != actual.FsConfig.AzBlobConfig.UseEmulator {
 		return errors.New("Azure Blob use emulator mismatch")
 	}
+	if expected.FsConfig.AzBlobConfig.AccessTier != actual.FsConfig.AzBlobConfig.AccessTier {
+		return errors.New("Azure Blob access tier mismatch")
+	}
 	return nil
 }
 
-func checkEncryptedSecret(expectedAccessSecret, actualAccessSecret string) error {
-	if len(expectedAccessSecret) > 0 {
-		vals := strings.Split(expectedAccessSecret, "$")
-		if strings.HasPrefix(expectedAccessSecret, "$aes$") && len(vals) == 4 {
-			expectedAccessSecret = utils.RemoveDecryptionKey(expectedAccessSecret)
-			if expectedAccessSecret != actualAccessSecret {
-				return fmt.Errorf("secret mismatch, expected: %v", expectedAccessSecret)
-			}
-		} else {
-			// here we check that actualAccessSecret is aes encrypted without the nonce
-			parts := strings.Split(actualAccessSecret, "$")
-			if !strings.HasPrefix(actualAccessSecret, "$aes$") || len(parts) != 3 {
-				return errors.New("invalid secret")
-			}
-			if len(parts) == len(vals) {
-				if expectedAccessSecret != actualAccessSecret {
-					return errors.New("encrypted secret mismatch")
-				}
-			}
+func areSecretEquals(expected, actual *kms.Secret) bool {
+	if expected == nil && actual == nil {
+		return true
+	}
+	if expected != nil && expected.IsEmpty() && actual == nil {
+		return true
+	}
+	if actual != nil && actual.IsEmpty() && expected == nil {
+		return true
+	}
+	return false
+}
+
+func checkEncryptedSecret(expected, actual *kms.Secret) error {
+	if areSecretEquals(expected, actual) {
+		return nil
+	}
+	if expected == nil && actual != nil && !actual.IsEmpty() {
+		return errors.New("secret mismatch")
+	}
+	if actual == nil && expected != nil && !expected.IsEmpty() {
+		return errors.New("secret mismatch")
+	}
+	if expected.IsPlain() && actual.IsEncrypted() {
+		if actual.GetPayload() == "" {
+			return errors.New("invalid secret payload")
+		}
+		if actual.GetAdditionalData() != "" {
+			return errors.New("invalid secret additional data")
+		}
+		if actual.GetKey() != "" {
+			return errors.New("invalid secret key")
 		}
 	} else {
-		if expectedAccessSecret != actualAccessSecret {
+		if expected.GetStatus() != actual.GetStatus() || expected.GetPayload() != actual.GetPayload() {
 			return errors.New("secret mismatch")
 		}
 	}
@@ -774,6 +794,40 @@ func compareUserFilters(expected *dataprovider.User, actual *dataprovider.User) 
 	if err := compareUserFileExtensionsFilters(expected, actual); err != nil {
 		return err
 	}
+	return compareUserFilePatternsFilters(expected, actual)
+}
+
+func checkFilterMatch(expected []string, actual []string) bool {
+	if len(expected) != len(actual) {
+		return false
+	}
+	for _, e := range expected {
+		if !utils.IsStringInSlice(strings.ToLower(e), actual) {
+			return false
+		}
+	}
+	return true
+}
+
+func compareUserFilePatternsFilters(expected *dataprovider.User, actual *dataprovider.User) error {
+	if len(expected.Filters.FilePatterns) != len(actual.Filters.FilePatterns) {
+		return errors.New("file patterns mismatch")
+	}
+	for _, f := range expected.Filters.FilePatterns {
+		found := false
+		for _, f1 := range actual.Filters.FilePatterns {
+			if path.Clean(f.Path) == path.Clean(f1.Path) {
+				if !checkFilterMatch(f.AllowedPatterns, f1.AllowedPatterns) ||
+					!checkFilterMatch(f.DeniedPatterns, f1.DeniedPatterns) {
+					return errors.New("file patterns contents mismatch")
+				}
+				found = true
+			}
+		}
+		if !found {
+			return errors.New("file patterns contents mismatch")
+		}
+	}
 	return nil
 }
 
@@ -785,18 +839,9 @@ func compareUserFileExtensionsFilters(expected *dataprovider.User, actual *datap
 		found := false
 		for _, f1 := range actual.Filters.FileExtensions {
 			if path.Clean(f.Path) == path.Clean(f1.Path) {
-				if len(f.AllowedExtensions) != len(f1.AllowedExtensions) || len(f.DeniedExtensions) != len(f1.DeniedExtensions) {
+				if !checkFilterMatch(f.AllowedExtensions, f1.AllowedExtensions) ||
+					!checkFilterMatch(f.DeniedExtensions, f1.DeniedExtensions) {
 					return errors.New("file extensions contents mismatch")
-				}
-				for _, e := range f.AllowedExtensions {
-					if !utils.IsStringInSlice(e, f1.AllowedExtensions) {
-						return errors.New("file extensions contents mismatch")
-					}
-				}
-				for _, e := range f.DeniedExtensions {
-					if !utils.IsStringInSlice(e, f1.DeniedExtensions) {
-						return errors.New("file extensions contents mismatch")
-					}
 				}
 				found = true
 			}
@@ -844,6 +889,9 @@ func compareEqualsUserFields(expected *dataprovider.User, actual *dataprovider.U
 	}
 	if expected.ExpirationDate != actual.ExpirationDate {
 		return errors.New("ExpirationDate mismatch")
+	}
+	if expected.AdditionalInfo != actual.AdditionalInfo {
+		return errors.New("AdditionalInfo mismatch")
 	}
 	return nil
 }

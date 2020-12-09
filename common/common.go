@@ -124,7 +124,7 @@ func startIdleTimeoutTicker(duration time.Duration) {
 			case <-idleTimeoutTickerDone:
 				return
 			case <-idleTimeoutTicker.C:
-				Connections.checkIdleConnections()
+				Connections.checkIdles()
 			}
 		}
 	}()
@@ -223,6 +223,8 @@ type Configuration struct {
 	Actions ProtocolActions `json:"actions" mapstructure:"actions"`
 	// SetstatMode 0 means "normal mode": requests for changing permissions and owner/group are executed.
 	// 1 means "ignore mode": requests for changing permissions and owner/group are silently ignored.
+	// 2 means "ignore mode for cloud fs": requests for changing permissions and owner/group/time are
+	// silently ignored for cloud based filesystem such as S3, GCS, Azure Blob
 	SetstatMode int `json:"setstat_mode" mapstructure:"setstat_mode"`
 	// Support for HAProxy PROXY protocol.
 	// If you are running SFTPGo behind a proxy server such as HAProxy, AWS ELB or NGNIX, you can enable
@@ -429,24 +431,18 @@ func (conns *ActiveConnections) Remove(connectionID string) {
 	conns.Lock()
 	defer conns.Unlock()
 
-	var c ActiveConnection
-	indexToRemove := -1
-	for i, conn := range conns.connections {
+	for idx, conn := range conns.connections {
 		if conn.GetID() == connectionID {
-			indexToRemove = i
-			c = conn
-			break
+			lastIdx := len(conns.connections) - 1
+			conns.connections[idx] = conns.connections[lastIdx]
+			conns.connections[lastIdx] = nil
+			conns.connections = conns.connections[:lastIdx]
+			metrics.UpdateActiveConnectionsSize(lastIdx)
+			logger.Debug(conn.GetProtocol(), conn.GetID(), "connection removed, num open connections: %v", lastIdx)
+			return
 		}
 	}
-	if indexToRemove >= 0 {
-		conns.connections[indexToRemove] = conns.connections[len(conns.connections)-1]
-		conns.connections[len(conns.connections)-1] = nil
-		conns.connections = conns.connections[:len(conns.connections)-1]
-		metrics.UpdateActiveConnectionsSize(len(conns.connections))
-		logger.Debug(c.GetProtocol(), c.GetID(), "connection removed, num open connections: %v", len(conns.connections))
-	} else {
-		logger.Warn(logSender, "", "connection to remove with id %#v not found!", connectionID)
-	}
+	logger.Warn(logSender, "", "connection id %#v to remove not found!", connectionID)
 }
 
 // Close closes an active connection.
@@ -484,26 +480,20 @@ func (conns *ActiveConnections) RemoveSSHConnection(connectionID string) {
 	conns.Lock()
 	defer conns.Unlock()
 
-	var c *SSHConnection
-	indexToRemove := -1
-	for i, conn := range conns.sshConnections {
+	for idx, conn := range conns.sshConnections {
 		if conn.GetID() == connectionID {
-			indexToRemove = i
-			c = conn
-			break
+			lastIdx := len(conns.sshConnections) - 1
+			conns.sshConnections[idx] = conns.sshConnections[lastIdx]
+			conns.sshConnections[lastIdx] = nil
+			conns.sshConnections = conns.sshConnections[:lastIdx]
+			logger.Debug(logSender, conn.GetID(), "ssh connection removed, num open ssh connections: %v", lastIdx)
+			return
 		}
 	}
-	if indexToRemove >= 0 {
-		conns.sshConnections[indexToRemove] = conns.sshConnections[len(conns.sshConnections)-1]
-		conns.sshConnections[len(conns.sshConnections)-1] = nil
-		conns.sshConnections = conns.sshConnections[:len(conns.sshConnections)-1]
-		logger.Debug(logSender, c.GetID(), "ssh connection removed, num open ssh connections: %v", len(conns.sshConnections))
-	} else {
-		logger.Warn(logSender, "", "ssh connection to remove with id %#v not found!", connectionID)
-	}
+	logger.Warn(logSender, "", "ssh connection to remove with id %#v not found!", connectionID)
 }
 
-func (conns *ActiveConnections) checkIdleConnections() {
+func (conns *ActiveConnections) checkIdles() {
 	conns.RLock()
 
 	for _, sshConn := range conns.sshConnections {
@@ -592,7 +582,7 @@ type ConnectionStatus struct {
 	Protocol string `json:"protocol"`
 	// active uploads/downloads
 	Transfers []ConnectionTransfer `json:"active_transfers,omitempty"`
-	// SSH command or WevDAV method
+	// SSH command or WebDAV method
 	Command string `json:"command,omitempty"`
 }
 

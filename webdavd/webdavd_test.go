@@ -1,8 +1,10 @@
 package webdavd_test
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -13,10 +15,12 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/minio/sio"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/studio-b12/gowebdav"
@@ -26,6 +30,7 @@ import (
 	"github.com/drakkan/sftpgo/dataprovider"
 	"github.com/drakkan/sftpgo/httpclient"
 	"github.com/drakkan/sftpgo/httpd"
+	"github.com/drakkan/sftpgo/kms"
 	"github.com/drakkan/sftpgo/logger"
 	"github.com/drakkan/sftpgo/vfs"
 	"github.com/drakkan/sftpgo/webdavd"
@@ -124,6 +129,12 @@ func TestMain(m *testing.M) {
 
 	httpConfig := config.GetHTTPConfig()
 	httpConfig.Initialize(configDir)
+	kmsConfig := config.GetKMSConfig()
+	err = kmsConfig.Initialize()
+	if err != nil {
+		logger.ErrorToConsole("error initializing kms: %v", err)
+		os.Exit(1)
+	}
 
 	httpdConf := config.GetHTTPDConfig()
 	httpdConf.BindPort = 8078
@@ -144,6 +155,12 @@ func TestMain(m *testing.M) {
 		},
 		AllowedHeaders:   []string{"*"},
 		AllowCredentials: true,
+	}
+
+	status := webdavd.GetStatus()
+	if status.IsActive {
+		logger.ErrorToConsole("webdav server is already active")
+		os.Exit(1)
 	}
 
 	extAuthPath = filepath.Join(homeBasePath, "extauth.sh")
@@ -180,18 +197,19 @@ func TestMain(m *testing.M) {
 }
 
 func TestInitialization(t *testing.T) {
-	config := webdavd.Configuration{
+	cfg := webdavd.Configuration{
 		BindPort:           1234,
 		CertificateFile:    "missing path",
 		CertificateKeyFile: "bad path",
 	}
-	err := config.Initialize(configDir)
+	err := cfg.Initialize(configDir)
 	assert.Error(t, err)
 
-	config.BindPort = webDavServerPort
-	config.CertificateFile = certPath
-	config.CertificateKeyFile = keyPath
-	err = config.Initialize(configDir)
+	cfg.Cache = config.GetWebDAVDConfig().Cache
+	cfg.BindPort = webDavServerPort
+	cfg.CertificateFile = certPath
+	cfg.CertificateKeyFile = keyPath
+	err = cfg.Initialize(configDir)
 	assert.Error(t, err)
 	err = webdavd.ReloadTLSCertificate()
 	assert.NoError(t, err)
@@ -253,9 +271,11 @@ func TestBasicHandling(t *testing.T) {
 	assert.NoError(t, err)
 	err = uploadFile(testFilePath, path.Join(testDir, testFileName+".txt"), testFileSize, client)
 	assert.NoError(t, err)
+	err = uploadFile(testFilePath, path.Join(testDir, testFileName), testFileSize, client)
+	assert.NoError(t, err)
 	files, err := client.ReadDir(testDir)
 	assert.NoError(t, err)
-	assert.Len(t, files, 4)
+	assert.Len(t, files, 5)
 	err = client.Copy(testDir, testDir+"_copy", false)
 	assert.NoError(t, err)
 	err = client.RemoveAll(testDir)
@@ -270,6 +290,120 @@ func TestBasicHandling(t *testing.T) {
 	err = os.RemoveAll(user.GetHomeDir())
 	assert.NoError(t, err)
 	assert.Len(t, common.Connections.GetStats(), 0)
+	status := webdavd.GetStatus()
+	assert.True(t, status.IsActive)
+}
+
+func TestBasicHandlingCryptFs(t *testing.T) {
+	u := getTestUserWithCryptFs()
+	u.QuotaSize = 6553600
+	user, _, err := httpd.AddUser(u, http.StatusOK)
+	assert.NoError(t, err)
+	client := getWebDavClient(user)
+	assert.NoError(t, checkBasicFunc(client))
+
+	testFilePath := filepath.Join(homeBasePath, testFileName)
+	testFileSize := int64(65535)
+	encryptedFileSize, err := getEncryptedFileSize(testFileSize)
+	assert.NoError(t, err)
+	expectedQuotaSize := user.UsedQuotaSize + encryptedFileSize
+	expectedQuotaFiles := user.UsedQuotaFiles + 1
+	err = createTestFile(testFilePath, testFileSize)
+	assert.NoError(t, err)
+	err = uploadFile(testFilePath, testFileName, testFileSize, client)
+	assert.NoError(t, err)
+	// overwrite an existing file
+	err = uploadFile(testFilePath, testFileName, testFileSize, client)
+	assert.NoError(t, err)
+	localDownloadPath := filepath.Join(homeBasePath, testDLFileName)
+	err = downloadFile(testFileName, localDownloadPath, testFileSize, client)
+	assert.NoError(t, err)
+	user, _, err = httpd.GetUserByID(user.ID, http.StatusOK)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedQuotaFiles, user.UsedQuotaFiles)
+	assert.Equal(t, expectedQuotaSize, user.UsedQuotaSize)
+	files, err := client.ReadDir("/")
+	assert.NoError(t, err)
+	if assert.Len(t, files, 1) {
+		assert.Equal(t, testFileSize, files[0].Size())
+	}
+	err = client.Remove(testFileName)
+	assert.NoError(t, err)
+	user, _, err = httpd.GetUserByID(user.ID, http.StatusOK)
+	assert.NoError(t, err)
+	assert.Equal(t, expectedQuotaFiles-1, user.UsedQuotaFiles)
+	assert.Equal(t, expectedQuotaSize-encryptedFileSize, user.UsedQuotaSize)
+	err = downloadFile(testFileName, localDownloadPath, testFileSize, client)
+	assert.Error(t, err)
+	testDir := "testdir"
+	err = client.Mkdir(testDir, os.ModePerm)
+	assert.NoError(t, err)
+	err = client.MkdirAll(path.Join(testDir, "sub", "sub"), os.ModePerm)
+	assert.NoError(t, err)
+	err = client.MkdirAll(path.Join(testDir, "sub1", "sub1"), os.ModePerm)
+	assert.NoError(t, err)
+	err = client.MkdirAll(path.Join(testDir, "sub2", "sub2"), os.ModePerm)
+	assert.NoError(t, err)
+	err = uploadFile(testFilePath, path.Join(testDir, testFileName+".txt"), testFileSize, client)
+	assert.NoError(t, err)
+	err = uploadFile(testFilePath, path.Join(testDir, testFileName), testFileSize, client)
+	assert.NoError(t, err)
+	files, err = client.ReadDir(testDir)
+	assert.NoError(t, err)
+	assert.Len(t, files, 5)
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), testFileName) {
+			assert.Equal(t, testFileSize, f.Size())
+		} else {
+			assert.True(t, f.IsDir())
+		}
+	}
+	err = os.Remove(testFilePath)
+	assert.NoError(t, err)
+	err = os.Remove(localDownloadPath)
+	assert.NoError(t, err)
+	_, err = httpd.RemoveUser(user, http.StatusOK)
+	assert.NoError(t, err)
+	err = os.RemoveAll(user.GetHomeDir())
+	assert.NoError(t, err)
+	assert.Len(t, common.Connections.GetStats(), 0)
+}
+
+func TestPropPatch(t *testing.T) {
+	for _, u := range []dataprovider.User{getTestUser(), getTestUserWithCryptFs()} {
+		user, _, err := httpd.AddUser(u, http.StatusOK)
+		assert.NoError(t, err)
+		client := getWebDavClient(user)
+		assert.NoError(t, checkBasicFunc(client))
+
+		testFilePath := filepath.Join(homeBasePath, testFileName)
+		testFileSize := int64(65535)
+		err = createTestFile(testFilePath, testFileSize)
+		assert.NoError(t, err)
+		err = uploadFile(testFilePath, testFileName, testFileSize, client)
+		assert.NoError(t, err)
+		httpClient := httpclient.GetHTTPClient()
+		propatchBody := `<?xml version="1.0" encoding="utf-8" ?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32CreationTime>Wed, 04 Nov 2020 13:25:51 GMT</Z:Win32CreationTime><Z:Win32LastAccessTime>Sat, 05 Dec 2020 21:16:12 GMT</Z:Win32LastAccessTime><Z:Win32LastModifiedTime>Wed, 04 Nov 2020 13:25:51 GMT</Z:Win32LastModifiedTime><Z:Win32FileAttributes>00000000</Z:Win32FileAttributes></D:prop></D:set></D:propertyupdate>`
+		req, err := http.NewRequest("PROPPATCH", fmt.Sprintf("http://%v/%v/%v", webDavServerAddr, user.Username, testFileName), bytes.NewReader([]byte(propatchBody)))
+		assert.NoError(t, err)
+		req.SetBasicAuth(u.Username, u.Password)
+		resp, err := httpClient.Do(req)
+		assert.NoError(t, err)
+		assert.Equal(t, 207, resp.StatusCode)
+		err = resp.Body.Close()
+		assert.NoError(t, err)
+		info, err := client.Stat(testFileName)
+		if assert.NoError(t, err) {
+			assert.Equal(t, testFileSize, info.Size())
+		}
+		err = os.Remove(testFilePath)
+		assert.NoError(t, err)
+		_, err = httpd.RemoveUser(user, http.StatusOK)
+		assert.NoError(t, err)
+		err = os.RemoveAll(user.GetHomeDir())
+		assert.NoError(t, err)
+		assert.Len(t, common.Connections.GetStats(), 0)
+	}
 }
 
 func TestLoginInvalidPwd(t *testing.T) {
@@ -300,6 +434,50 @@ func TestLoginInvalidURL(t *testing.T) {
 	_, err = httpd.RemoveUser(user, http.StatusOK)
 	assert.NoError(t, err)
 	_, err = httpd.RemoveUser(user1, http.StatusOK)
+	assert.NoError(t, err)
+}
+
+func TestRootRedirect(t *testing.T) {
+	errRedirect := errors.New("redirect error")
+	u := getTestUser()
+	user, _, err := httpd.AddUser(u, http.StatusOK)
+	assert.NoError(t, err)
+	client := getWebDavClient(user)
+	assert.NoError(t, checkBasicFunc(client))
+	rootPath := fmt.Sprintf("http://%v/", webDavServerAddr)
+	httpClient := httpclient.GetHTTPClient()
+	httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return errRedirect
+	}
+	req, err := http.NewRequest(http.MethodOptions, rootPath, nil)
+	assert.NoError(t, err)
+	req.SetBasicAuth(u.Username, u.Password)
+	resp, err := httpClient.Do(req)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), errRedirect.Error())
+	}
+	err = resp.Body.Close()
+	assert.NoError(t, err)
+	req, err = http.NewRequest(http.MethodGet, rootPath, nil)
+	assert.NoError(t, err)
+	req.SetBasicAuth(u.Username, u.Password)
+	resp, err = httpClient.Do(req)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), errRedirect.Error())
+	}
+	err = resp.Body.Close()
+	assert.NoError(t, err)
+	req, err = http.NewRequest("PROPFIND", rootPath, nil)
+	assert.NoError(t, err)
+	req.SetBasicAuth(u.Username, u.Password)
+	resp, err = httpClient.Do(req)
+	if assert.Error(t, err) {
+		assert.Contains(t, err.Error(), errRedirect.Error())
+	}
+	err = resp.Body.Close()
+	assert.NoError(t, err)
+
+	_, err = httpd.RemoveUser(user, http.StatusOK)
 	assert.NoError(t, err)
 }
 
@@ -480,18 +658,27 @@ func TestDownloadErrors(t *testing.T) {
 	u.Permissions[path.Join("/", subDir1)] = []string{dataprovider.PermListItems}
 	u.Permissions[path.Join("/", subDir2)] = []string{dataprovider.PermListItems, dataprovider.PermUpload,
 		dataprovider.PermDelete, dataprovider.PermDownload}
+	// use an unknown mime to trigger content type detection
 	u.Filters.FileExtensions = []dataprovider.ExtensionsFilter{
 		{
 			Path:              "/sub2",
 			AllowedExtensions: []string{},
-			DeniedExtensions:  []string{".zip"},
+			DeniedExtensions:  []string{".zipp"},
+		},
+	}
+	u.Filters.FilePatterns = []dataprovider.PatternsFilter{
+		{
+			Path:            "/sub2",
+			AllowedPatterns: []string{},
+			DeniedPatterns:  []string{"*.jpg"},
 		},
 	}
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
 	client := getWebDavClient(user)
-	testFilePath1 := filepath.Join(user.HomeDir, subDir1, "file.zip")
-	testFilePath2 := filepath.Join(user.HomeDir, subDir2, "file.zip")
+	testFilePath1 := filepath.Join(user.HomeDir, subDir1, "file.zipp")
+	testFilePath2 := filepath.Join(user.HomeDir, subDir2, "file.zipp")
+	testFilePath3 := filepath.Join(user.HomeDir, subDir2, "file.jpg")
 	err = os.MkdirAll(filepath.Dir(testFilePath1), os.ModePerm)
 	assert.NoError(t, err)
 	err = os.MkdirAll(filepath.Dir(testFilePath2), os.ModePerm)
@@ -500,10 +687,14 @@ func TestDownloadErrors(t *testing.T) {
 	assert.NoError(t, err)
 	err = ioutil.WriteFile(testFilePath2, []byte("file2"), os.ModePerm)
 	assert.NoError(t, err)
+	err = ioutil.WriteFile(testFilePath3, []byte("file3"), os.ModePerm)
+	assert.NoError(t, err)
 	localDownloadPath := filepath.Join(homeBasePath, testDLFileName)
-	err = downloadFile(path.Join("/", subDir1, "file.zip"), localDownloadPath, 5, client)
+	err = downloadFile(path.Join("/", subDir1, "file.zipp"), localDownloadPath, 5, client)
 	assert.Error(t, err)
-	err = downloadFile(path.Join("/", subDir2, "file.zip"), localDownloadPath, 5, client)
+	err = downloadFile(path.Join("/", subDir2, "file.zipp"), localDownloadPath, 5, client)
+	assert.Error(t, err)
+	err = downloadFile(path.Join("/", subDir2, "file.jpg"), localDownloadPath, 5, client)
 	assert.Error(t, err)
 	err = downloadFile(path.Join("missing.zip"), localDownloadPath, 5, client)
 	assert.Error(t, err)
@@ -640,6 +831,9 @@ func TestQuotaLimits(t *testing.T) {
 	assert.Error(t, err)
 	err = client.Rename(testFileName+".quota", testFileName, false)
 	assert.NoError(t, err)
+	files, err := client.ReadDir("/")
+	assert.NoError(t, err)
+	assert.Len(t, files, 1)
 	// test quota size
 	user.QuotaSize = testFileSize - 1
 	user.QuotaFiles = 0
@@ -797,7 +991,7 @@ func TestLoginWithDatabaseCredentials(t *testing.T) {
 	u := getTestUser()
 	u.FsConfig.Provider = dataprovider.GCSFilesystemProvider
 	u.FsConfig.GCSConfig.Bucket = "test"
-	u.FsConfig.GCSConfig.Credentials = []byte(`{ "type": "service_account" }`)
+	u.FsConfig.GCSConfig.Credentials = kms.NewPlainSecret(`{ "type": "service_account" }`)
 
 	providerConf := config.GetProviderConf()
 	providerConf.PreferDatabaseCredentials = true
@@ -818,9 +1012,12 @@ func TestLoginWithDatabaseCredentials(t *testing.T) {
 
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
+	assert.Equal(t, kms.SecretStatusSecretBox, user.FsConfig.GCSConfig.Credentials.GetStatus())
+	assert.NotEmpty(t, user.FsConfig.GCSConfig.Credentials.GetPayload())
+	assert.Empty(t, user.FsConfig.GCSConfig.Credentials.GetAdditionalData())
+	assert.Empty(t, user.FsConfig.GCSConfig.Credentials.GetKey())
 
-	_, err = os.Stat(credentialsFile)
-	assert.Error(t, err)
+	assert.NoFileExists(t, credentialsFile)
 
 	client := getWebDavClient(user)
 
@@ -842,7 +1039,7 @@ func TestLoginInvalidFs(t *testing.T) {
 	u := getTestUser()
 	u.FsConfig.Provider = dataprovider.GCSFilesystemProvider
 	u.FsConfig.GCSConfig.Bucket = "test"
-	u.FsConfig.GCSConfig.Credentials = []byte("invalid JSON for credentials")
+	u.FsConfig.GCSConfig.Credentials = kms.NewPlainSecret("invalid JSON for credentials")
 	user, _, err := httpd.AddUser(u, http.StatusOK)
 	assert.NoError(t, err)
 
@@ -866,49 +1063,50 @@ func TestLoginInvalidFs(t *testing.T) {
 }
 
 func TestBytesRangeRequests(t *testing.T) {
-	u := getTestUser()
-	user, _, err := httpd.AddUser(u, http.StatusOK)
-	assert.NoError(t, err)
-	testFileName := "test_file.txt"
-	testFilePath := filepath.Join(homeBasePath, testFileName)
-	fileContent := []byte("test file contents")
-	err = ioutil.WriteFile(testFilePath, fileContent, os.ModePerm)
-	assert.NoError(t, err)
-	client := getWebDavClient(user)
-	err = uploadFile(testFilePath, testFileName, int64(len(fileContent)), client)
-	assert.NoError(t, err)
-	remotePath := fmt.Sprintf("http://%v/%v/%v", webDavServerAddr, user.Username, testFileName)
-	req, err := http.NewRequest(http.MethodGet, remotePath, nil)
-	if assert.NoError(t, err) {
-		httpClient := httpclient.GetHTTPClient()
-		req.SetBasicAuth(user.Username, defaultPassword)
-		req.Header.Set("Range", "bytes=5-")
-		resp, err := httpClient.Do(req)
+	for _, u := range []dataprovider.User{getTestUser(), getTestUserWithCryptFs()} {
+		user, _, err := httpd.AddUser(u, http.StatusOK)
+		assert.NoError(t, err)
+		testFileName := "test_file.txt"
+		testFilePath := filepath.Join(homeBasePath, testFileName)
+		fileContent := []byte("test file contents")
+		err = ioutil.WriteFile(testFilePath, fileContent, os.ModePerm)
+		assert.NoError(t, err)
+		client := getWebDavClient(user)
+		err = uploadFile(testFilePath, testFileName, int64(len(fileContent)), client)
+		assert.NoError(t, err)
+		remotePath := fmt.Sprintf("http://%v/%v/%v", webDavServerAddr, user.Username, testFileName)
+		req, err := http.NewRequest(http.MethodGet, remotePath, nil)
 		if assert.NoError(t, err) {
-			defer resp.Body.Close()
-			assert.Equal(t, http.StatusPartialContent, resp.StatusCode)
-			bodyBytes, err := ioutil.ReadAll(resp.Body)
-			assert.NoError(t, err)
-			assert.Equal(t, "file contents", string(bodyBytes))
+			httpClient := httpclient.GetHTTPClient()
+			req.SetBasicAuth(user.Username, defaultPassword)
+			req.Header.Set("Range", "bytes=5-")
+			resp, err := httpClient.Do(req)
+			if assert.NoError(t, err) {
+				defer resp.Body.Close()
+				assert.Equal(t, http.StatusPartialContent, resp.StatusCode)
+				bodyBytes, err := ioutil.ReadAll(resp.Body)
+				assert.NoError(t, err)
+				assert.Equal(t, "file contents", string(bodyBytes))
+			}
+			req.Header.Set("Range", "bytes=5-8")
+			resp, err = httpClient.Do(req)
+			if assert.NoError(t, err) {
+				defer resp.Body.Close()
+				assert.Equal(t, http.StatusPartialContent, resp.StatusCode)
+				bodyBytes, err := ioutil.ReadAll(resp.Body)
+				assert.NoError(t, err)
+				assert.Equal(t, "file", string(bodyBytes))
+			}
 		}
-		req.Header.Set("Range", "bytes=5-8")
-		resp, err = httpClient.Do(req)
-		if assert.NoError(t, err) {
-			defer resp.Body.Close()
-			assert.Equal(t, http.StatusPartialContent, resp.StatusCode)
-			bodyBytes, err := ioutil.ReadAll(resp.Body)
-			assert.NoError(t, err)
-			assert.Equal(t, "file", string(bodyBytes))
-		}
-	}
 
-	assert.NoError(t, err)
-	err = os.Remove(testFilePath)
-	assert.NoError(t, err)
-	_, err = httpd.RemoveUser(user, http.StatusOK)
-	assert.NoError(t, err)
-	err = os.RemoveAll(user.GetHomeDir())
-	assert.NoError(t, err)
+		assert.NoError(t, err)
+		err = os.Remove(testFilePath)
+		assert.NoError(t, err)
+		_, err = httpd.RemoveUser(user, http.StatusOK)
+		assert.NoError(t, err)
+		err = os.RemoveAll(user.GetHomeDir())
+		assert.NoError(t, err)
+	}
 }
 
 func TestGETAsPROPFIND(t *testing.T) {
@@ -929,7 +1127,7 @@ func TestGETAsPROPFIND(t *testing.T) {
 		}
 	}
 	client := getWebDavClient(user)
-	err = client.MkdirAll(path.Join(subDir1, "sub"), os.ModePerm)
+	err = client.MkdirAll(path.Join(subDir1, "sub", "sub1"), os.ModePerm)
 	assert.NoError(t, err)
 	subPath := fmt.Sprintf("http://%v/%v", webDavServerAddr, path.Join(user.Username, subDir1))
 	req, err = http.NewRequest(http.MethodGet, subPath, nil)
@@ -937,10 +1135,36 @@ func TestGETAsPROPFIND(t *testing.T) {
 		req.SetBasicAuth(u.Username, u.Password)
 		resp, err := httpClient.Do(req)
 		if assert.NoError(t, err) {
-			assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+			// before the performance patch we have a 500 here, now we have 207 but an empty list
+			//assert.Equal(t, http.StatusInternalServerError, resp.StatusCode)
+			assert.Equal(t, http.StatusMultiStatus, resp.StatusCode)
 			resp.Body.Close()
 		}
 	}
+	// we cannot stat the sub at all
+	subPath1 := fmt.Sprintf("http://%v/%v", webDavServerAddr, path.Join(user.Username, subDir1, "sub"))
+	req, err = http.NewRequest(http.MethodGet, subPath1, nil)
+	if assert.NoError(t, err) {
+		req.SetBasicAuth(u.Username, u.Password)
+		resp, err := httpClient.Do(req)
+		if assert.NoError(t, err) {
+			// here the stat will fail, so the request will not be changed in propfind
+			assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+			resp.Body.Close()
+		}
+	}
+
+	// we have no permission, we get an empty list
+	files, err := client.ReadDir(subDir1)
+	assert.NoError(t, err)
+	assert.Len(t, files, 0)
+	// if we grant the permissions the files are listed
+	user.Permissions[subDir1] = []string{dataprovider.PermDownload, dataprovider.PermListItems}
+	user, _, err = httpd.UpdateUser(user, http.StatusOK, "")
+	assert.NoError(t, err)
+	files, err = client.ReadDir(subDir1)
+	assert.NoError(t, err)
+	assert.Len(t, files, 1)
 
 	_, err = httpd.RemoveUser(user, http.StatusOK)
 	assert.NoError(t, err)
@@ -1194,6 +1418,18 @@ func getTestUser() dataprovider.User {
 	user.Permissions = make(map[string][]string)
 	user.Permissions["/"] = allPerms
 	return user
+}
+
+func getTestUserWithCryptFs() dataprovider.User {
+	user := getTestUser()
+	user.FsConfig.Provider = dataprovider.CryptedFilesystemProvider
+	user.FsConfig.CryptConfig.Passphrase = kms.NewPlainSecret("testPassphrase")
+	return user
+}
+
+func getEncryptedFileSize(size int64) (int64, error) {
+	encSize, err := sio.EncryptedSize(uint64(size))
+	return int64(encSize) + 33, err
 }
 
 func getExtAuthScriptContent(user dataprovider.User, nonJSONResponse bool, username string) []byte {

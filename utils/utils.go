@@ -53,6 +53,22 @@ func IsStringPrefixInSlice(obj string, list []string) bool {
 	return false
 }
 
+// RemoveDuplicates returns a new slice removing any duplicate element from the initial one
+func RemoveDuplicates(obj []string) []string {
+	if len(obj) == 0 {
+		return obj
+	}
+	result := make([]string, 0, len(obj))
+	seen := make(map[string]bool)
+	for _, item := range obj {
+		if _, ok := seen[item]; !ok {
+			result = append(result, item)
+		}
+		seen[item] = true
+	}
+	return result
+}
+
 // GetTimeAsMsSinceEpoch returns unix timestamp as milliseconds from a time struct
 func GetTimeAsMsSinceEpoch(t time.Time) int64 {
 	return t.UnixNano() / 1000000
@@ -177,6 +193,9 @@ func DecryptData(data string) (string, error) {
 		return result, err
 	}
 	nonceSize := gcm.NonceSize()
+	if len(encrypted) < nonceSize {
+		return result, errors.New("malformed ciphertext")
+	}
 	nonce, ciphertext := encrypted[:nonceSize], encrypted[nonceSize:]
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {

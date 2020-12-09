@@ -28,6 +28,7 @@ For each account, the following properties can be configured:
   - `chtimes` changing file or directory access and modification time is allowed
 - `upload_bandwidth` maximum upload bandwidth as KB/s, 0 means unlimited.
 - `download_bandwidth` maximum download bandwidth as KB/s, 0 means unlimited.
+- `last_login` last user login as unix timestamp in milliseconds. It is saved at most once every 10 minutes
 - `allowed_ip`, List of IP/Mask allowed to login. Any IP address not contained in this list cannot login. IP/Mask must be in CIDR notation as defined in RFC 4632 and RFC 4291, for example "192.0.2.0/24" or "2001:db8::/32"
 - `denied_ip`, List of IP/Mask not allowed to login. If an IP address is both allowed and denied then login will be denied
 - `max_upload_file_size`, max allowed size, as bytes, for a single file upload. The upload will be aborted if/when the size of the file being sent exceeds this limit. 0 means unlimited. This restriction does not apply for SSH system commands such as `git` and `rsync`
@@ -41,39 +42,53 @@ For each account, the following properties can be configured:
   - `SSH`
   - `FTP`
   - `DAV`
-- `file_extensions`, list of struct. These restrictions do not apply to files listing for performance reasons, so a denied file cannot be downloaded/overwritten/renamed but it will still be listed in the list of files. Please note that these restrictions can be easily bypassed. Each struct contains the following fields:
-  - `allowed_extensions`, list of, case insensitive, allowed files extension. Shell like expansion is not supported so you have to specify `.jpg` and not `*.jpg`. Any file that does not end with this suffix will be denied
-  - `denied_extensions`, list of, case insensitive, denied files extension. Denied file extensions are evaluated before the allowed ones
-  - `path`, SFTP/SCP path, if no other specific filter is defined, the filter apply for sub directories too. For example if filters are defined for the paths `/` and `/sub` then the filters for `/` are applied for any file outside the `/sub` directory
-- `fs_provider`, filesystem to serve via SFTP. Local filesystem, S3 Compatible Object Storage, Google Cloud Storage and Azure Blob Storage are supported
+- `file_extensions`, list of struct. Deprecated, please use `file_patterns`. These restrictions do not apply to files listing for performance reasons, so a denied file cannot be downloaded/overwritten/renamed but it will still be in the list of files. Please note that these restrictions can be easily bypassed. Each struct contains the following fields:
+  - `allowed_extensions`, list of, case insensitive, allowed file extensions. Shell like expansion is not supported so you have to specify `.jpg` and not `*.jpg`. Any file that does not end with this suffix will be denied
+  - `denied_extensions`, list of, case insensitive, denied file extensions. Denied file extensions are evaluated before the allowed ones
+  - `path`, exposed virtual path, if no other specific filter is defined, the filter apply for sub directories too. For example if filters are defined for the paths `/` and `/sub` then the filters for `/` are applied for any file outside the `/sub` directory
+- `file_patterns`, list of struct. These restrictions do not apply to files listing for performance reasons, so a denied file cannot be downloaded/overwritten/renamed but it will still be in the list of files. Please note that these restrictions can be easily bypassed. For syntax details take a look [here](https://golang.org/pkg/path/#Match). Each struct contains the following fields:
+  - `allowed_patterns`, list of, case insensitive, allowed file patterns. Examples: `*.jpg`, `a*b?.png`. Any non matching file will be denied
+  - `denied_patterns`, list of, case insensitive, denied file patterns. Denied file patterns are evaluated before the allowed ones
+  - `path`, exposed virtual path, if no other specific filter is defined, the filter apply for sub directories too. For example if filters are defined for the paths `/` and `/sub` then the filters for `/` are applied for any file outside the `/sub` directory
+- `fs_provider`, filesystem to serve via SFTP. Local filesystem (0), S3 Compatible Object Storage (1), Google Cloud Storage (2), Azure Blob Storage (3) and encrypted local filesystem (4) are supported
 - `s3_bucket`, required for S3 filesystem
 - `s3_region`, required for S3 filesystem. Must match the region for your bucket. You can find here the list of available [AWS regions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-regions-availability-zones.html#concepts-available-regions). For example if your bucket is at `Frankfurt` you have to set the region to `eu-central-1`
 - `s3_access_key`
-- `s3_access_secret`, if provided it is stored encrypted (AES-256-GCM). You can leave access key and access secret blank to use credentials from environment
+- `s3_access_secret`, if provided it is stored encrypted based on kms configuration. You can leave access key and access secret blank to use credentials from environment
 - `s3_endpoint`, specifies a S3 endpoint (server) different from AWS. It is not required if you are connecting to AWS
 - `s3_storage_class`, leave blank to use the default or specify a valid AWS [storage class](https://docs.aws.amazon.com/AmazonS3/latest/dev/storage-class-intro.html)
 - `s3_key_prefix`, allows to restrict access to the folder identified by this prefix and its contents
 - `s3_upload_part_size`, the buffer size for multipart uploads (MB). Zero means the default (5 MB). Minimum is 5
 - `s3_upload_concurrency` how many parts are uploaded in parallel
 - `gcs_bucket`, required for GCS filesystem
-- `gcs_credentials`, Google Cloud Storage JSON credentials base64 encoded
+- `gcs_credentials`, Google Cloud Storage JSON credentials base64 encoded. Credentials are stored encrypted based on kms configuration
 - `gcs_automatic_credentials`, integer. Set to 1 to use Application Default Credentials strategy or set to 0 to use explicit credentials via `gcs_credentials`
 - `gcs_storage_class`
 - `gcs_key_prefix`, allows to restrict access to the folder identified by this prefix and its contents
 - `az_container`, Azure Blob Storage container
 - `az_account_name`, Azure account name. leave blank to use SAS URL
-- `az_account_key`, Azure account key. leave blank to use SAS URL. If provided it is stored encrypted (AES-256-GCM)
+- `az_account_key`, Azure account key. leave blank to use SAS URL. If provided it is stored encrypted based on kms configuration
 - `az_sas_url`, Azure shared access signature URL
 - `az_endpoint`, Default is "blob.core.windows.net". If you use the emulator the endpoint must include the protocol, for example "http://127.0.0.1:10000"
 - `az_upload_part_size`, the buffer size for multipart uploads (MB). Zero means the default (4 MB)
 - `az_upload_concurrency`,  how many parts are uploaded in parallel. Zero means the default (2)
 - `az_key_prefix`,  allows to restrict access to the folder identified by this prefix and its contents
 - `az_use_emulator`, boolean
+- `crypt_passphrase`, passphrase to use for local encryption
+- `additional_info`, string. Free text field
 
 These properties are stored inside the data provider.
 
 If you want to use your existing accounts, you have these options:
 
-- If your accounts are already stored inside a supported database, you can create a database view. Since a view is read only, you have to disable user management and quota tracking so SFTPGo will never try to write to the view
 - you can import your users inside SFTPGo. Take a look at [sftpgo_api_cli](../examples/rest-api-cli#convert-users-from-other-stores "SFTPGo API CLI example"), it can convert and import users from Linux system users and Pure-FTPd/ProFTPD virtual users
 - you can use an external authentication program
+
+Please take a look at the [OpenAPI schema](../httpd/schema/openapi.yaml) for the exact definitions of user and folder fields.
+If you need an example you can export a dump using the REST API CLI client or by invoking the `dumpdata` endpoint directly, for example:
+
+```shell
+curl "http://127.0.0.1:8080/api/v1/dumpdata?output_file=dump.json&indent=1"
+```
+
+the dump is a JSON with users and folder.
